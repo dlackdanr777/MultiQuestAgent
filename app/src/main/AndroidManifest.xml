@@ -1,0 +1,164 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- 타 앱 실행 및 제어를 위한 패키지 쿼리 리스트 -->
+    <queries>
+        <package android:name="com.StoryWing.EnglishTown" />
+        <package android:name="com.StoryWing.AlphabatApp" />
+        <package android:name="com.StoryWing.Ocean_Adventure" />
+        <package android:name="com.StoryWing.OceanAdventure" />
+        <package android:name="com.StoryWing.Korea_History" />
+        <package android:name="com.StoryWing.KoreaHistory2" />
+        <package android:name="com.StoryWing.Solar_System" />
+        <package android:name="com.StoryWing.SpaceApp" />
+        <package android:name="com.StoryWing.Fire_Safety" />
+        <package android:name="com.StoryWing.FirepreventionApp" />
+        <package android:name="com.StoryWing.Jurassic" />
+        <package android:name="com.StoryWing.BrainPop" />
+        <package android:name="com.StoryWing.XR_BrainTraining" />
+        <package android:name="com.StoryWing.SmartFarm" />
+        <package android:name="com.StoryWing.GyeongjuMR" />
+        <package android:name="com.StoryWing.Museum" />
+        <package android:name="com.StoryWing.XR_Museum" />
+        <package android:name="com.StoryWing.World_Travel" />
+        <package android:name="com.StoryWing.XR_WorldMap" />
+        <package android:name="com.StoryWing.OceanAdventure_ViewVer" />
+        <package android:name="com.StoryWing.SpaceAppTest" />
+        <package android:name="com.StoryWing.XR_Coding" />
+        <package android:name="com.StoryWing.Storywing_Class" />
+        <package android:name="com.StoryWing.StorywingClass" />
+        <package android:name="com.StoryWing.App1" />
+        <package android:name="com.StoryWing.App2" />
+        <package android:name="com.StoryWing.App3" />
+        <package android:name="com.StoryWing.App4" />
+        <package android:name="com.StoryWing.App5" />
+        <package android:name="com.StoryWing.App6" />
+        <package android:name="com.StoryWing.App7" />
+        <package android:name="com.StoryWing.App8" />
+        <package android:name="com.StoryWing.App9" />
+        <package android:name="com.StoryWing.App10" />
+        <package android:name="com.StoryWing.App11" />
+        <package android:name="com.StoryWing.App12" />
+        <package android:name="com.StoryWing.App13" />
+        <package android:name="com.StoryWing.App14" />
+        <package android:name="com.StoryWing.App15" />
+        <package android:name="com.StoryWing.App16" />
+        <package android:name="com.StoryWing.App17" />
+        <package android:name="com.StoryWing.App18" />
+        <package android:name="com.StoryWing.App19" />
+        <package android:name="com.StoryWing.App20" />
+    </queries>
+
+    <!-- 네트워크 및 Wi-Fi 권한 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+
+    <!-- 부팅 및 서비스 실행 권한 -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+
+    <!-- Android 14+ foreground service type 권한 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+
+    <!-- 절전 방지 / 알림 / 배터리 최적화 제외 요청 -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <application
+        android:allowBackup="false"
+        android:usesCleartextTraffic="true"
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:theme="@style/Theme.AppCompat.Light.NoActionBar">
+
+        <!-- 1. 메인 액티비티 -->
+        <!-- 사용자가 직접 앱 아이콘을 눌렀을 때만 뜨는 설정/수동 조작 화면 -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:configChanges="orientation|screenSize|keyboardHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 2. 화면공유 권한 전용 투명 Activity -->
+        <!-- 권한창만 띄우고 승인 후 즉시 종료됨 -->
+        <activity
+            android:name=".CapturePermissionActivity"
+            android:exported="false"
+            android:theme="@style/Theme.MultiQuest.Transparent"
+            android:launchMode="singleTask"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:finishOnTaskLaunch="true"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+
+        <!-- 3. 절전 방지용 Activity -->
+        <!--
+            WPF에서 /command/showKeepAwake 또는 /command/wake 호출 시 실행됩니다.
+
+            중요:
+            - noHistory="true" 넣지 마십시오.
+            - KeepAwakeActivity가 살아 있어야 FLAG_KEEP_SCREEN_ON이 유지됩니다.
+            - 화면을 완전히 가리지 않도록 Activity 코드에서 투명/비포커스 처리를 합니다.
+        -->
+        <activity
+            android:name=".KeepAwakeActivity"
+            android:exported="false"
+            android:theme="@style/Theme.MultiQuest.Transparent"
+            android:launchMode="singleTask"
+            android:excludeFromRecents="true"
+            android:finishOnTaskLaunch="false"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+
+        <!-- 4. 에이전트 서비스 -->
+        <!-- 와치독, HTTP 상태 서버, mDNS 광고, WPF 명령 처리 담당 -->
+        <service
+            android:name=".agent.AgentService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+
+        <!-- 5. 캡처 서비스 -->
+        <!-- 실제 MediaProjection 화면 송출 담당 -->
+        <service
+            android:name=".capture.CaptureService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
+
+        <!-- 6. 부팅 및 앱 업데이트 감지 리시버 -->
+        <receiver
+            android:name=".BootReceiver"
+            android:directBootAware="true"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <receiver
+            android:name=".agent.StoryWingAppStateReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.storywing.multiquest.APP_STATE" />
+            </intent-filter>
+        </receiver>
+
+    </application>
+
+</manifest>
