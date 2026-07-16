@@ -27,14 +27,9 @@ object KeepAliveController {
         private set
 
     /**
-     * WPF 연결 유지 모드.
-     *
-     * 목표:
-     * - 화면은 깨우지 않습니다.
-     * - CPU는 suspend되지 않게 유지합니다.
-     * - Wi-Fi 연결은 최대한 유지합니다.
-     * - AgentService / HTTP status 서버가 화면 꺼짐 뒤에도 살아 있게 합니다.
+     * 화면을 강제로 켜는 기능이 아니라 CPU와 Wi-Fi 연결을 유지합니다.
      */
+    @Synchronized
     @SuppressLint("WakelockTimeout")
     fun acquire(context: Context) {
         val appContext = context.applicationContext
@@ -42,11 +37,14 @@ object KeepAliveController {
         acquireCpuWakeLock(appContext)
         acquireWifiLock(appContext)
 
-        isEnabled = isCpuWakeLockHeld || isWifiLockHeld
+        isEnabled =
+            isCpuWakeLockHeld ||
+                    isWifiLockHeld
 
         Log.i(
             TAG,
-            "KeepAlive acquired. cpu=$isCpuWakeLockHeld wifi=$isWifiLockHeld"
+            "KeepAlive acquired. " +
+                    "cpu=$isCpuWakeLockHeld wifi=$isWifiLockHeld"
         )
     }
 
@@ -59,7 +57,9 @@ object KeepAliveController {
             }
 
             val powerManager =
-                context.getSystemService(Context.POWER_SERVICE) as PowerManager
+                context.getSystemService(
+                    Context.POWER_SERVICE
+                ) as PowerManager
 
             cpuWakeLock = powerManager.newWakeLock(
                 PowerManager.PARTIAL_WAKE_LOCK,
@@ -69,10 +69,10 @@ object KeepAliveController {
                 acquire()
             }
 
-            isCpuWakeLockHeld = cpuWakeLock?.isHeld == true
-
-            Log.i(TAG, "CPU partial wake lock acquired. screen wake disabled.")
+            isCpuWakeLockHeld =
+                cpuWakeLock?.isHeld == true
         } catch (e: Exception) {
+            cpuWakeLock = null
             isCpuWakeLockHeld = false
             Log.e(TAG, "CPU wake lock acquire failed", e)
         }
@@ -86,14 +86,17 @@ object KeepAliveController {
             }
 
             val wifiManager =
-                context.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                context.getSystemService(
+                    Context.WIFI_SERVICE
+                ) as WifiManager
 
-            val wifiMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-            } else {
-                @Suppress("DEPRECATION")
-                WifiManager.WIFI_MODE_FULL_HIGH_PERF
-            }
+            val wifiMode =
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                } else {
+                    @Suppress("DEPRECATION")
+                    WifiManager.WIFI_MODE_FULL_HIGH_PERF
+                }
 
             wifiLock = wifiManager.createWifiLock(
                 wifiMode,
@@ -103,24 +106,21 @@ object KeepAliveController {
                 acquire()
             }
 
-            isWifiLockHeld = wifiLock?.isHeld == true
-
-            Log.i(TAG, "Wi-Fi lock acquired. mode=$wifiMode")
+            isWifiLockHeld =
+                wifiLock?.isHeld == true
         } catch (e: Exception) {
+            wifiLock = null
             isWifiLockHeld = false
             Log.e(TAG, "Wi-Fi lock acquire failed", e)
         }
     }
 
-    /**
-     * AgentService가 완전히 종료될 때만 호출합니다.
-     * CaptureService 종료 시에는 release하지 마십시오.
-     */
+    @Synchronized
     fun release() {
         try {
-            cpuWakeLock?.let {
-                if (it.isHeld) {
-                    it.release()
+            cpuWakeLock?.let { lock ->
+                if (lock.isHeld) {
+                    lock.release()
                 }
             }
         } catch (e: Exception) {
@@ -131,9 +131,9 @@ object KeepAliveController {
         }
 
         try {
-            wifiLock?.let {
-                if (it.isHeld) {
-                    it.release()
+            wifiLock?.let { lock ->
+                if (lock.isHeld) {
+                    lock.release()
                 }
             }
         } catch (e: Exception) {
@@ -144,7 +144,6 @@ object KeepAliveController {
         }
 
         isEnabled = false
-
-        Log.i(TAG, "KeepAlive released.")
+        Log.i(TAG, "KeepAlive released")
     }
 }

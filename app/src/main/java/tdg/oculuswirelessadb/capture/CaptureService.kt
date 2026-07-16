@@ -19,6 +19,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
 import android.view.Surface
@@ -33,6 +34,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import tdg.oculuswirelessadb.agent.AgentOperationStore
 import tdg.oculuswirelessadb.agent.AgentStatus
 import tdg.oculuswirelessadb.rtsp.RtspH264TcpServer
 import java.util.concurrent.Executors
@@ -45,6 +47,8 @@ class CaptureService : Service() {
         const val ACTION_STOP = "tdg.oculuswirelessadb.capture.STOP"
         const val EXTRA_RESULT_CODE = "RESULT_CODE"
         const val EXTRA_DATA = "DATA"
+        const val EXTRA_OPERATION_ID = "OPERATION_ID"
+        const val EXTRA_START_REASON = "START_REASON"
 
         private const val TAG = "MQ-Capture"
 
@@ -70,14 +74,30 @@ class CaptureService : Service() {
         private const val VIRTUAL_DISPLAY_START_DELAY_MS = 1_200L
 
         @Volatile
-        var isRunning = false
+        var isServiceAlive: Boolean = false
             private set
 
-        fun start(context: Context, resultCode: Int, data: Intent) {
+        @Volatile
+        var isCleanupInProgress: Boolean = false
+            private set
+
+        /** 기존 호출부 호환용입니다. 실제 송출 여부는 CaptureStateStore로 판단하십시오. */
+        val isRunning: Boolean
+            get() = isServiceAlive
+
+        fun start(
+            context: Context,
+            resultCode: Int,
+            data: Intent,
+            operationId: String = "",
+            reason: String = ""
+        ) {
             val intent = Intent(context, CaptureService::class.java).apply {
                 action = ACTION_START
                 putExtra(EXTRA_RESULT_CODE, resultCode)
                 putExtra(EXTRA_DATA, data)
+                putExtra(EXTRA_OPERATION_ID, operationId)
+                putExtra(EXTRA_START_REASON, reason)
             }
 
             ContextCompat.startForegroundService(context, intent)
@@ -88,7 +108,24 @@ class CaptureService : Service() {
                 action = ACTION_STOP
             }
 
-            context.startService(intent)
+            try {
+                context.startService(intent)
+            } catch (_: Exception) {
+                context.stopService(Intent(context, CaptureService::class.java))
+            }
+        }
+
+        suspend fun awaitFullyStopped(timeoutMs: Long = 8_000L): Boolean {
+            val deadline = SystemClock.elapsedRealtime() + timeoutMs.coerceAtLeast(0L)
+
+            while (SystemClock.elapsedRealtime() < deadline) {
+                if (!isServiceAlive && !isCleanupInProgress) {
+                    return true
+                }
+                delay(100L)
+            }
+
+            return !isServiceAlive && !isCleanupInProgress
         }
     }
 
@@ -135,7 +172,16 @@ class CaptureService : Service() {
     private var startScheduled = false
 
     @Volatile
+    private var stopSelfWhenCleanupDone = false
+
+    @Volatile
     private var lifecycleGeneration = 0L
+
+    @Volatile
+    private var activeOperationId: String = ""
+
+    @Volatile
+    private var activeStartReason: String = ""
 
     private var pendingStartRunnable: Runnable? = null
 
@@ -151,7 +197,8 @@ class CaptureService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        isRunning = true
+        isServiceAlive = true
+        isCleanupInProgress = false
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -169,6 +216,8 @@ class CaptureService : Service() {
         }
 
         if (intent.action == ACTION_START) {
+            val operationId = intent.getStringExtra(EXTRA_OPERATION_ID).orEmpty()
+            val startReason = intent.getStringExtra(EXTRA_START_REASON).orEmpty()
             val state = CaptureStateStore.state
 
             if (
@@ -184,18 +233,42 @@ class CaptureService : Service() {
                     "ACTION_START ignored: already starting/running. " +
                             "state=$state, startScheduled=$startScheduled"
                 )
-                return START_STICKY
+
+                if (operationId.isNotBlank()) {
+                    if (state == CaptureStateStore.STATE_RUNNING) {
+                        AgentOperationStore.complete(
+                            operationId,
+                            "capture_already_running"
+                        )
+                    } else {
+                        AgentOperationStore.markStarting(
+                            operationId,
+                            "capture_already_starting"
+                        )
+                    }
+                }
+
+                return START_NOT_STICKY
             }
 
             val startGeneration = bumpLifecycleGeneration()
 
-            isRunning = true
+            activeOperationId = operationId
+            activeStartReason = startReason
+            isServiceAlive = true
+            isCleanupInProgress = false
             isStopping = false
             lastKeyFrameRequestAtMs = 0L
 
             startAsForeground("화면 송출 준비 중...")
 
-            CaptureStateStore.startNewSession()
+            CaptureStateStore.startNewSession(operationId)
+            if (operationId.isNotBlank()) {
+                AgentOperationStore.markStarting(
+                    operationId,
+                    "CaptureService ACTION_START"
+                )
+            }
 
             val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
 
@@ -213,13 +286,22 @@ class CaptureService : Service() {
                     generation = startGeneration
                 )
             } else {
-                Log.w(TAG, "Invalid MediaProjection result. resultCode=$resultCode, data=$data")
-                CaptureStateStore.clearToIdle()
+                val message = "invalid_media_projection_result"
+                Log.w(TAG, "$message. resultCode=$resultCode, data=$data")
+                CaptureStateStore.setError(message)
+                if (operationId.isNotBlank()) {
+                    AgentOperationStore.fail(
+                        operationId,
+                        message,
+                        retryable = true
+                    )
+                }
+                stopForegroundCompat()
                 stopSelf()
             }
         }
 
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     @Synchronized
@@ -283,10 +365,14 @@ class CaptureService : Service() {
         generation: Long
     ) {
         try {
-            Log.i(TAG, "startCapture begin. generation=$generation")
+            Log.i(
+                TAG,
+                "startCapture begin. generation=$generation reason=$activeStartReason operationId=$activeOperationId"
+            )
 
-            isStopping = true
+            isCleanupInProgress = true
             cleanupCaptureResources(stopProjection = true)
+            isCleanupInProgress = false
 
             if (generation != lifecycleGeneration) {
                 Log.i(
@@ -294,6 +380,7 @@ class CaptureService : Service() {
                     "startCapture aborted after cleanup: stale generation. " +
                             "generation=$generation current=$lifecycleGeneration"
                 )
+                finishAbortedStart("STALE_GENERATION_AFTER_CLEANUP")
                 return
             }
 
@@ -307,9 +394,27 @@ class CaptureService : Service() {
 
             projection = mediaProjection
 
+            val callbackGeneration = generation
             val callback = object : MediaProjection.Callback() {
                 override fun onStop() {
+                    if (callbackGeneration != lifecycleGeneration) {
+                        Log.i(
+                            TAG,
+                            "Stale MediaProjection callback ignored. callbackGeneration=$callbackGeneration current=$lifecycleGeneration"
+                        )
+                        return
+                    }
+
                     Log.w(TAG, "MediaProjection onStop() called by system")
+
+                    val operationId = activeOperationId
+                    if (operationId.isNotBlank()) {
+                        AgentOperationStore.fail(
+                            operationId,
+                            "media_projection_stopped",
+                            retryable = true
+                        )
+                    }
 
                     stopCaptureAsync(
                         finalState = CaptureStateStore.STATE_IDLE,
@@ -436,6 +541,17 @@ class CaptureService : Service() {
             }
         } catch (e: Exception) {
             Log.e(TAG, "startCapture failed", e)
+
+            isCleanupInProgress = false
+
+            val operationId = activeOperationId
+            if (operationId.isNotBlank()) {
+                AgentOperationStore.fail(
+                    operationId,
+                    e.message ?: e.javaClass.simpleName,
+                    retryable = true
+                )
+            }
 
             stopCaptureAsync(
                 finalState = CaptureStateStore.STATE_ERROR,
@@ -635,11 +751,24 @@ class CaptureService : Service() {
                                     inPps = null
                                 )
 
-                                CaptureStateStore.updateFrameStatus()
+                                val frameNumber = CaptureStateStore.updateFrameStatus()
 
-                                if (CaptureStateStore.encodedFrameCount == 1L) {
+                                if (frameNumber == 1L) {
                                     Log.i(TAG, "First encoded frame received")
                                     updateNotification("송출 중: ${CaptureStateStore.rtspUrl}")
+
+                                    val operationId = activeOperationId
+                                    if (operationId.isNotBlank()) {
+                                        AgentOperationStore.complete(
+                                            operationId,
+                                            "first_encoded_frame",
+                                            org.json.JSONObject()
+                                                .put("streamGeneration", CaptureStateStore.streamGeneration)
+                                                .put("rtspUrl", CaptureStateStore.rtspUrl)
+                                        )
+                                        CaptureStateStore.completeOperation(operationId)
+                                        activeOperationId = ""
+                                    }
 
                                     mainHandler.postDelayed({
                                         requestKeyFrame("first_frame_after_encoder_output")
@@ -715,7 +844,7 @@ class CaptureService : Service() {
         try {
             if (isStopping) return
 
-            val now = System.currentTimeMillis()
+            val now = SystemClock.elapsedRealtime()
 
             if (now - lastKeyFrameRequestAtMs < MIN_KEYFRAME_REQUEST_INTERVAL_MS) {
                 Log.d(
@@ -781,22 +910,31 @@ class CaptureService : Service() {
     ) {
         cancelPendingStart()
 
+        if (stopSelfAfter) {
+            stopSelfWhenCleanupDone = true
+        }
+
+        if (isCleanupInProgress && !isStopping) {
+            val cancelledGeneration = bumpLifecycleGeneration()
+            isStopping = true
+            Log.i(
+                TAG,
+                "stopCapture requested during cleanup. reason=$reason generation=$cancelledGeneration"
+            )
+            return
+        }
+
         if (isStopping) {
-            Log.i(TAG, "stopCapture ignored: already stopping. reason=$reason")
-
-            if (stopSelfAfter) {
-                mainHandler.post {
-                    stopForegroundCompat()
-                    stopSelf()
-                }
-            }
-
+            Log.i(
+                TAG,
+                "stopCapture merged: already stopping. reason=$reason stopSelfAfter=$stopSelfAfter"
+            )
             return
         }
 
         val stopGeneration = bumpLifecycleGeneration()
-
         isStopping = true
+        isCleanupInProgress = true
 
         Log.i(
             TAG,
@@ -817,6 +955,8 @@ class CaptureService : Service() {
             cleanupCaptureResources(stopProjection = stopProjection)
 
             mainHandler.post {
+                isCleanupInProgress = false
+
                 if (stopGeneration != lifecycleGeneration) {
                     Log.i(
                         TAG,
@@ -842,13 +982,55 @@ class CaptureService : Service() {
                     }
                 }
 
-                isRunning = false
+                val operationId = activeOperationId
+                if (
+                    operationId.isNotBlank() &&
+                    AgentOperationStore.isPending(operationId)
+                ) {
+                    AgentOperationStore.fail(
+                        operationId,
+                        errorMessage.ifBlank { reason.ifBlank { "capture_stopped" } },
+                        retryable = finalState != CaptureStateStore.STATE_STOPPED
+                    )
+                }
 
-                if (stopSelfAfter) {
+                activeOperationId = ""
+                activeStartReason = ""
+                isServiceAlive = false
+                isStopping = false
+
+                if (stopSelfWhenCleanupDone) {
+                    stopSelfWhenCleanupDone = false
                     stopForegroundCompat()
                     stopSelf()
                 }
             }
+        }
+    }
+
+    private fun finishAbortedStart(reason: String) {
+        val operationId = activeOperationId
+        if (operationId.isNotBlank() && AgentOperationStore.isPending(operationId)) {
+            AgentOperationStore.fail(
+                operationId,
+                reason,
+                retryable = true
+            )
+        }
+
+        activeOperationId = ""
+        activeStartReason = ""
+        isCleanupInProgress = false
+        isServiceAlive = false
+        isStopping = false
+        CaptureStateStore.clearToIdle()
+
+        mainHandler.post {
+            if (stopSelfWhenCleanupDone) {
+                stopSelfWhenCleanupDone = false
+            }
+            stopForegroundCompat()
+            stopSelf()
         }
     }
 
@@ -978,6 +1160,7 @@ class CaptureService : Service() {
         cancelPendingStart()
 
         isStopping = true
+        isCleanupInProgress = true
 
         stopPeriodicKeyFrameRequests()
 
@@ -985,7 +1168,22 @@ class CaptureService : Service() {
             cleanupCaptureResources(stopProjection = true)
         } catch (e: Exception) {
             Log.e(TAG, "onDestroy cleanup failed", e)
+        } finally {
+            isCleanupInProgress = false
+            isServiceAlive = false
+            isStopping = false
         }
+
+        val operationId = activeOperationId
+        if (operationId.isNotBlank() && AgentOperationStore.isPending(operationId)) {
+            AgentOperationStore.fail(
+                operationId,
+                "capture_service_destroyed",
+                retryable = true
+            )
+        }
+        activeOperationId = ""
+        activeStartReason = ""
 
         serviceScope.cancel()
 

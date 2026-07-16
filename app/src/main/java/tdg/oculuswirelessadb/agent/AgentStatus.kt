@@ -8,37 +8,76 @@ import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.BatteryManager
 import android.os.Build
+import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
 import org.json.JSONObject
+import tdg.oculuswirelessadb.capture.CaptureService
 import tdg.oculuswirelessadb.capture.CaptureStateStore
 import java.net.Inet4Address
 
 object AgentStatus {
 
-    private const val TAG = "MQ-CMD"
-    private const val AGENT_VERSION = "rtsp-agent-1.0.0"
+    private const val TAG = "MQ-STATUS"
+    private const val AGENT_VERSION = "rtsp-agent-1.5.0"
+    private const val API_VERSION = 5
 
-    /**
-     * StableDeviceId를 사용하여 앱 삭제 후에도 유지되는 고유 ID를 반환합니다.
-     */
+    private const val BATTERY_CACHE_MS = 3_000L
+    private const val THERMAL_CACHE_MS = 10_000L
+    private const val STATUS_LOG_INTERVAL_MS = 10_000L
+
+    private data class BatterySnapshot(
+        val level: Int,
+        val charging: Boolean,
+        val chargingStatus: String,
+        val temperatureTenthsC: Int
+    )
+
+    private data class ThermalSnapshot(
+        val status: Int,
+        val statusName: String,
+        val headroom: Float
+    )
+
+    private val cacheLock = Any()
+
+    private var batteryCachedAtElapsedMs = 0L
+    private var cachedBattery = BatterySnapshot(
+        level = -1,
+        charging = false,
+        chargingStatus = "Unknown",
+        temperatureTenthsC = -1
+    )
+
+    private var thermalCachedAtElapsedMs = 0L
+    private var cachedThermal = ThermalSnapshot(
+        status = -1,
+        statusName = "UNAVAILABLE",
+        headroom = Float.NaN
+    )
+
+    private var lastStatusLogAtElapsedMs = 0L
+
     fun deviceId(context: Context): String {
         return StableDeviceId.get(context)
     }
 
-    /**
-     * 현재 기기의 IPv4 주소를 반환합니다.
-     */
     fun currentIpv4(context: Context): String? {
         return try {
-            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-            val network = cm.activeNetwork ?: return null
-            val caps = cm.getNetworkCapabilities(network) ?: return null
+            val connectivityManager =
+                context.getSystemService(Context.CONNECTIVITY_SERVICE)
+                        as ConnectivityManager
 
-            if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+            val network = connectivityManager.activeNetwork ?: return null
+            val capabilities =
+                connectivityManager.getNetworkCapabilities(network) ?: return null
+
+            if (!capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
                 return null
             }
 
-            val linkProperties = cm.getLinkProperties(network) ?: return null
+            val linkProperties =
+                connectivityManager.getLinkProperties(network) ?: return null
 
             linkProperties.linkAddresses
                 .map { it.address }
@@ -51,187 +90,276 @@ object AgentStatus {
         }
     }
 
-    /**
-     * 배터리 잔량을 반환합니다.
-     */
-    fun batteryLevel(context: Context): Int {
-        return try {
-            val intent = context.registerReceiver(
-                null,
-                IntentFilter(Intent.ACTION_BATTERY_CHANGED)
-            ) ?: return -1
+    fun statusJson(
+        context: Context,
+        statusPort: Int,
+        rtspPort: Int
+    ): String {
+        val appContext = context.applicationContext
+        val deviceId = deviceId(appContext)
 
-            val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
-            val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
-
-            if (level < 0 || scale <= 0) {
-                -1
-            } else {
-                (level * 100 / scale.toFloat()).toInt()
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "batteryLevel failed", e)
-            -1
-        }
-    }
-
-    /**
-     * 충전 중 여부를 반환합니다.
-     */
-    fun isCharging(context: Context): Boolean {
-        return try {
-            val intent = context.registerReceiver(
-                null,
-                IntentFilter(Intent.ACTION_BATTERY_CHANGED)
-            ) ?: return false
-
-            val status = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
-
-            val isChargingStatus =
-                status == BatteryManager.BATTERY_STATUS_CHARGING ||
-                        status == BatteryManager.BATTERY_STATUS_FULL
-
-            val plugged = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, -1)
-
-            val isPlugged =
-                plugged == BatteryManager.BATTERY_PLUGGED_AC ||
-                        plugged == BatteryManager.BATTERY_PLUGGED_USB ||
-                        plugged == BatteryManager.BATTERY_PLUGGED_WIRELESS
-
-            isChargingStatus || isPlugged
-        } catch (e: Exception) {
-            Log.e(TAG, "isCharging failed", e)
-            false
-        }
-    }
-
-    /**
-     * 충전 상태 문자열을 반환합니다.
-     * WPF 표시용입니다.
-     */
-    fun chargingStatus(context: Context): String {
-        return try {
-            val intent = context.registerReceiver(
-                null,
-                IntentFilter(Intent.ACTION_BATTERY_CHANGED)
-            ) ?: return "Unknown"
-
-            when (intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)) {
-                BatteryManager.BATTERY_STATUS_CHARGING -> "Charging"
-                BatteryManager.BATTERY_STATUS_FULL -> "Full"
-                BatteryManager.BATTERY_STATUS_DISCHARGING -> "Discharging"
-                BatteryManager.BATTERY_STATUS_NOT_CHARGING -> "Not charging"
-                else -> "Unknown"
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "chargingStatus failed", e)
-            "Unknown"
-        }
-    }
-
-    /**
-     * 배터리 온도를 반환합니다.
-     * Android BatteryManager.EXTRA_TEMPERATURE는 0.1도 단위입니다.
-     */
-    fun batteryTemperature(context: Context): Int {
-        return try {
-            val intent = context.registerReceiver(
-                null,
-                IntentFilter(Intent.ACTION_BATTERY_CHANGED)
-            ) ?: return -1
-
-            intent.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, -1)
-        } catch (e: Exception) {
-            Log.e(TAG, "batteryTemperature failed", e)
-            -1
-        }
-    }
-
-    /**
-     * WPF 클라이언트가 기기 상태를 파악하기 위해 호출하는 JSON 데이터를 생성합니다.
-     */
-    fun statusJson(context: Context, statusPort: Int, rtspPort: Int): String {
-        val deviceId = deviceId(context)
-
-        var deviceName = AgentNameStore.getDeviceName(context)
-        if (deviceName.isBlank()) {
-            deviceName = "Quest3_${deviceId.take(4)}"
+        val savedName = AgentNameStore.getDeviceName(appContext)
+        val deviceName = savedName.ifBlank {
+            "Quest3_${deviceId.take(4)}"
         }
 
-        val ip = currentIpv4(context) ?: "0.0.0.0"
+        val ip = currentIpv4(appContext) ?: "0.0.0.0"
+        val capture = CaptureStateStore.snapshot()
+        val battery = batterySnapshot(appContext)
+        val thermal = thermalSnapshot(appContext)
+        val power = powerSnapshot(appContext)
 
-        val rtspUrl = if (CaptureStateStore.rtspUrl.isBlank()) {
-            "rtsp://$ip:$rtspPort/live"
+        val rtspUrl = capture.rtspUrl.ifBlank {
+            "rtsp://$ip:$rtspPort/live/${capture.streamGeneration}"
+        }
+
+        val temperatureC = if (battery.temperatureTenthsC >= 0) {
+            battery.temperatureTenthsC / 10.0
         } else {
-            CaptureStateStore.rtspUrl
+            -1.0
         }
-
-        val frameAgeMs = CaptureStateStore.getFrameAgeMs()
-        val stateDurationMs = CaptureStateStore.getStateDurationMs()
 
         val json = JSONObject()
             .put("ok", true)
+            .put("apiVersion", API_VERSION)
 
-            // 기본 식별 정보
             .put("deviceName", deviceName)
             .put("deviceId", deviceId)
-            .put("model", Build.MODEL)
+            .put("model", Build.MODEL ?: "")
             .put("serial", getSerial())
             .put("ip", ip)
             .put("statusPort", statusPort)
 
-            // RTSP 정보
             .put("rtspPort", rtspPort)
             .put("rtspUrl", rtspUrl)
 
-            // 배터리 정보
-            .put("battery", batteryLevel(context))
-            .put("isCharging", isCharging(context))
-            .put("chargingStatus", chargingStatus(context))
-            .put("temperature", batteryTemperature(context))
+            .put("battery", battery.level)
+            .put("isCharging", battery.charging)
+            .put("chargingStatus", battery.chargingStatus)
+            .put("temperature", battery.temperatureTenthsC)
+            .put("batteryTemperatureC", temperatureC)
 
-            // Android / Agent 정보
+            .put("interactive", power.first)
+            .put("deviceIdle", power.second)
+            .put("deviceUptimeMs", SystemClock.elapsedRealtime())
+
+            .put("thermalStatus", thermal.status)
+            .put("thermalStatusName", thermal.statusName)
+            .put(
+                "thermalHeadroom",
+                if (thermal.headroom.isNaN()) JSONObject.NULL else thermal.headroom.toDouble()
+            )
+
             .put("androidVersion", Build.VERSION.RELEASE ?: "")
             .put("buildNumber", Build.DISPLAY ?: "")
             .put("agentVersion", AGENT_VERSION)
 
-            // 송출 상태
-            .put("streamState", CaptureStateStore.state)
-            .put("streamGeneration", CaptureStateStore.streamGeneration)
+            .put("streamState", capture.state)
+            .put("streamGeneration", capture.streamGeneration)
+            .put("encodedFrameCount", capture.encodedFrameCount)
+            .put("lastFrameAtMs", capture.lastFrameAtMs)
+            .put("frameAgeMs", capture.frameAgeMs)
+            .put("stateDurationMs", capture.stateDurationMs)
+            .put("rtspClientCount", capture.rtspClientCount)
 
-            // 핵심 프레임 telemetry
-            // WPF ZeroFrames 오판 방지용입니다.
-            .put("encodedFrameCount", CaptureStateStore.encodedFrameCount)
-            .put("lastFrameAtMs", CaptureStateStore.lastFrameAtMs)
-            .put("frameAgeMs", frameAgeMs)
-            .put("stateDurationMs", stateDurationMs)
-            .put("rtspClientCount", CaptureStateStore.rtspClientCount)
+            .put("streamWidth", capture.width)
+            .put("streamHeight", capture.height)
+            .put("streamFps", capture.fps)
+            .put("streamBitrate", capture.bitrate)
 
-            // 송출 사양
-            .put("streamWidth", CaptureStateStore.width)
-            .put("streamHeight", CaptureStateStore.height)
-            .put("streamFps", CaptureStateStore.fps)
-            .put("streamBitrate", CaptureStateStore.bitrate)
+            .put("captureServiceAlive", CaptureService.isServiceAlive)
+            .put("captureCleanupInProgress", CaptureService.isCleanupInProgress)
+            .put("activeCaptureOperationId", capture.activeOperationId)
+            .put("lastCaptureError", capture.lastErrorMessage)
 
-            // 현재 시각
+            .put("keepAliveEnabled", KeepAliveController.isEnabled)
+            .put("cpuWakeLockHeld", KeepAliveController.isCpuWakeLockHeld)
+            .put("wifiLockHeld", KeepAliveController.isWifiLockHeld)
+
+            .put("appLaunchGuard", AppLaunchGuard.toJson())
+            .put("lastApp", LastLaunchedAppStore.toDebugJson(appContext))
+            .put("latestOperation", AgentOperationStore.latestJson())
             .put("timestamp", System.currentTimeMillis())
 
-        Log.d(
-            TAG,
-            "[DeviceStatus] name=$deviceName state=${CaptureStateStore.state} " +
-                    "frames=${CaptureStateStore.encodedFrameCount} " +
-                    "lastFrameAtMs=${CaptureStateStore.lastFrameAtMs} " +
-                    "frameAgeMs=$frameAgeMs " +
-                    "rtspClients=${CaptureStateStore.rtspClientCount}"
+        logStatusSample(
+            deviceName = deviceName,
+            capture = capture,
+            thermal = thermal,
+            temperatureC = temperatureC
         )
 
         return json.toString()
     }
 
-    /**
-     * 기기의 하드웨어 시리얼 번호를 가져옵니다.
-     * Android 보안 정책에 따라 UNKNOWN일 수 있습니다.
-     */
+    private fun batterySnapshot(context: Context): BatterySnapshot {
+        val now = SystemClock.elapsedRealtime()
+
+        synchronized(cacheLock) {
+            if (now - batteryCachedAtElapsedMs < BATTERY_CACHE_MS) {
+                return cachedBattery
+            }
+        }
+
+        val snapshot = try {
+            val intent = context.registerReceiver(
+                null,
+                IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+            )
+
+            if (intent == null) {
+                BatterySnapshot(-1, false, "Unknown", -1)
+            } else {
+                val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+                val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
+                val percentage = if (level >= 0 && scale > 0) {
+                    (level * 100f / scale).toInt()
+                } else {
+                    -1
+                }
+
+                val status = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+                val plugged = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0)
+
+                val chargingStatus = when (status) {
+                    BatteryManager.BATTERY_STATUS_CHARGING -> "Charging"
+                    BatteryManager.BATTERY_STATUS_FULL -> "Full"
+                    BatteryManager.BATTERY_STATUS_DISCHARGING -> "Discharging"
+                    BatteryManager.BATTERY_STATUS_NOT_CHARGING -> "Not charging"
+                    else -> "Unknown"
+                }
+
+                val charging =
+                    status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                            status == BatteryManager.BATTERY_STATUS_FULL ||
+                            plugged == BatteryManager.BATTERY_PLUGGED_AC ||
+                            plugged == BatteryManager.BATTERY_PLUGGED_USB ||
+                            plugged == BatteryManager.BATTERY_PLUGGED_WIRELESS
+
+                BatterySnapshot(
+                    level = percentage,
+                    charging = charging,
+                    chargingStatus = chargingStatus,
+                    temperatureTenthsC = intent.getIntExtra(
+                        BatteryManager.EXTRA_TEMPERATURE,
+                        -1
+                    )
+                )
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "batterySnapshot failed", e)
+            BatterySnapshot(-1, false, "Unknown", -1)
+        }
+
+        synchronized(cacheLock) {
+            cachedBattery = snapshot
+            batteryCachedAtElapsedMs = now
+        }
+
+        return snapshot
+    }
+
+    private fun thermalSnapshot(context: Context): ThermalSnapshot {
+        val now = SystemClock.elapsedRealtime()
+
+        synchronized(cacheLock) {
+            if (now - thermalCachedAtElapsedMs < THERMAL_CACHE_MS) {
+                return cachedThermal
+            }
+        }
+
+        val snapshot = try {
+            val powerManager =
+                context.getSystemService(Context.POWER_SERVICE) as PowerManager
+
+            val status = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                powerManager.currentThermalStatus
+            } else {
+                -1
+            }
+
+            val headroom = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                try {
+                    powerManager.getThermalHeadroom(10)
+                } catch (_: Exception) {
+                    Float.NaN
+                }
+            } else {
+                Float.NaN
+            }
+
+            ThermalSnapshot(
+                status = status,
+                statusName = thermalStatusName(status),
+                headroom = headroom
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "thermalSnapshot failed", e)
+            ThermalSnapshot(-1, "UNAVAILABLE", Float.NaN)
+        }
+
+        synchronized(cacheLock) {
+            cachedThermal = snapshot
+            thermalCachedAtElapsedMs = now
+        }
+
+        return snapshot
+    }
+
+    private fun powerSnapshot(context: Context): Pair<Boolean, Boolean> {
+        return try {
+            val powerManager =
+                context.getSystemService(Context.POWER_SERVICE) as PowerManager
+
+            val idle = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+                    powerManager.isDeviceIdleMode
+
+            powerManager.isInteractive to idle
+        } catch (_: Exception) {
+            false to false
+        }
+    }
+
+    private fun thermalStatusName(status: Int): String {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            return "UNAVAILABLE"
+        }
+
+        return when (status) {
+            PowerManager.THERMAL_STATUS_NONE -> "NONE"
+            PowerManager.THERMAL_STATUS_LIGHT -> "LIGHT"
+            PowerManager.THERMAL_STATUS_MODERATE -> "MODERATE"
+            PowerManager.THERMAL_STATUS_SEVERE -> "SEVERE"
+            PowerManager.THERMAL_STATUS_CRITICAL -> "CRITICAL"
+            PowerManager.THERMAL_STATUS_EMERGENCY -> "EMERGENCY"
+            PowerManager.THERMAL_STATUS_SHUTDOWN -> "SHUTDOWN"
+            else -> "UNKNOWN"
+        }
+    }
+
+    private fun logStatusSample(
+        deviceName: String,
+        capture: CaptureStateStore.Snapshot,
+        thermal: ThermalSnapshot,
+        temperatureC: Double
+    ) {
+        val now = SystemClock.elapsedRealtime()
+
+        synchronized(cacheLock) {
+            if (now - lastStatusLogAtElapsedMs < STATUS_LOG_INTERVAL_MS) {
+                return
+            }
+            lastStatusLogAtElapsedMs = now
+        }
+
+        Log.i(
+            TAG,
+            "name=$deviceName state=${capture.state} " +
+                    "frames=${capture.encodedFrameCount} frameAgeMs=${capture.frameAgeMs} " +
+                    "clients=${capture.rtspClientCount} thermal=${thermal.statusName} " +
+                    "headroom=${thermal.headroom} batteryTempC=$temperatureC"
+        )
+    }
+
     @SuppressLint("HardwareIds", "MissingPermission")
     fun getSerial(): String {
         return try {
@@ -243,7 +371,7 @@ object AgentStatus {
                 val serial = Build.SERIAL
                 if (serial == Build.UNKNOWN) "UNKNOWN" else serial
             }
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             "UNKNOWN"
         }
     }

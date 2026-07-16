@@ -1,5 +1,13 @@
 package tdg.oculuswirelessadb.capture
 
+import android.os.SystemClock
+
+/**
+ * 캡처 상태의 단일 진실 공급원입니다.
+ *
+ * 여러 @Volatile 필드를 각각 읽는 방식은 서로 다른 시점의 값이 섞일 수 있으므로,
+ * 모든 복합 상태 변경과 스냅샷 읽기를 하나의 lock으로 보호합니다.
+ */
 object CaptureStateStore {
 
     const val STATE_IDLE = "IDLE"
@@ -10,155 +18,269 @@ object CaptureStateStore {
     const val STATE_ERROR = "ERROR"
     const val STATE_FROZEN = "FROZEN"
 
-    // 20대 동시 운용 기본값
     private const val DEFAULT_WIDTH = 960
     private const val DEFAULT_HEIGHT = 540
     private const val DEFAULT_FPS = 10
     private const val DEFAULT_BITRATE = 700_000
 
-    // 안전 상한값
     private const val MAX_WIDTH = 1280
     private const val MAX_HEIGHT = 720
     private const val MAX_FPS = 15
     private const val MAX_BITRATE = 1_500_000
 
-    // 너무 낮게 설정되는 것 방지
     private const val MIN_WIDTH = 480
     private const val MIN_HEIGHT = 270
     private const val MIN_FPS = 5
     private const val MIN_BITRATE = 300_000
 
-    @Volatile
-    private var _state: String = STATE_IDLE
+    data class Snapshot(
+        val state: String,
+        val stateChangedAtMs: Long,
+        val stateDurationMs: Long,
+        val rtspUrl: String,
+        val streamGeneration: Int,
+        val encodedFrameCount: Long,
+        val lastFrameAtMs: Long,
+        val frameAgeMs: Long,
+        val rtspClientCount: Int,
+        val width: Int,
+        val height: Int,
+        val fps: Int,
+        val bitrate: Int,
+        val lastErrorMessage: String,
+        val activeOperationId: String
+    )
+
+    private val lock = Any()
+
+    private var stateValue: String = STATE_IDLE
+    private var stateChangedAtEpochMsValue: Long = System.currentTimeMillis()
+    private var stateChangedAtElapsedMsValue: Long = SystemClock.elapsedRealtime()
+
+    private var rtspUrlValue: String = ""
+    private var streamGenerationValue: Int = 0
+    private var encodedFrameCountValue: Long = 0L
+    private var lastFrameAtEpochMsValue: Long = 0L
+    private var lastFrameAtElapsedMsValue: Long = 0L
+    private var rtspClientCountValue: Int = 0
+
+    private var widthValue: Int = DEFAULT_WIDTH
+    private var heightValue: Int = DEFAULT_HEIGHT
+    private var fpsValue: Int = DEFAULT_FPS
+    private var bitrateValue: Int = DEFAULT_BITRATE
+
+    private var lastErrorMessageValue: String = ""
+    private var activeOperationIdValue: String = ""
 
     var state: String
-        get() = _state
-        set(value) {
-            if (_state != value) {
-                _state = value
-                lastStateChangedAtMs = System.currentTimeMillis()
+        get() = synchronized(lock) { stateValue }
+        set(value) = synchronized(lock) {
+            setStateLocked(value)
+        }
+
+    val lastStateChangedAtMs: Long
+        get() = synchronized(lock) { stateChangedAtEpochMsValue }
+
+    var rtspUrl: String
+        get() = synchronized(lock) { rtspUrlValue }
+        set(value) = synchronized(lock) {
+            rtspUrlValue = value.trim()
+        }
+
+    var streamGeneration: Int
+        get() = synchronized(lock) { streamGenerationValue }
+        set(value) = synchronized(lock) {
+            streamGenerationValue = value.coerceAtLeast(0)
+        }
+
+    var encodedFrameCount: Long
+        get() = synchronized(lock) { encodedFrameCountValue }
+        set(value) = synchronized(lock) {
+            encodedFrameCountValue = value.coerceAtLeast(0L)
+        }
+
+    var lastFrameAtMs: Long
+        get() = synchronized(lock) { lastFrameAtEpochMsValue }
+        set(value) = synchronized(lock) {
+            lastFrameAtEpochMsValue = value.coerceAtLeast(0L)
+            lastFrameAtElapsedMsValue = if (value > 0L) {
+                SystemClock.elapsedRealtime()
+            } else {
+                0L
             }
         }
 
-    @Volatile
-    var lastStateChangedAtMs: Long = System.currentTimeMillis()
+    var rtspClientCount: Int
+        get() = synchronized(lock) { rtspClientCountValue }
+        set(value) = synchronized(lock) {
+            rtspClientCountValue = value.coerceAtLeast(0)
+        }
 
-    @Volatile
-    var rtspUrl: String = ""
+    var width: Int
+        get() = synchronized(lock) { widthValue }
+        set(value) = synchronized(lock) {
+            widthValue = sanitizeEven(value, MIN_WIDTH, MAX_WIDTH, DEFAULT_WIDTH)
+        }
 
-    @Volatile
-    var streamGeneration: Int = 0
+    var height: Int
+        get() = synchronized(lock) { heightValue }
+        set(value) = synchronized(lock) {
+            heightValue = sanitizeEven(value, MIN_HEIGHT, MAX_HEIGHT, DEFAULT_HEIGHT)
+        }
 
-    @Volatile
-    var encodedFrameCount: Long = 0
+    var fps: Int
+        get() = synchronized(lock) { fpsValue }
+        set(value) = synchronized(lock) {
+            fpsValue = sanitizeInt(value, MIN_FPS, MAX_FPS, DEFAULT_FPS)
+        }
 
-    @Volatile
-    var lastFrameAtMs: Long = 0
+    var bitrate: Int
+        get() = synchronized(lock) { bitrateValue }
+        set(value) = synchronized(lock) {
+            bitrateValue = sanitizeInt(value, MIN_BITRATE, MAX_BITRATE, DEFAULT_BITRATE)
+        }
 
-    @Volatile
-    var rtspClientCount: Int = 0
+    var lastErrorMessage: String
+        get() = synchronized(lock) { lastErrorMessageValue }
+        set(value) = synchronized(lock) {
+            lastErrorMessageValue = value.trim()
+        }
 
-    @Volatile
-    var width: Int = DEFAULT_WIDTH
+    var activeOperationId: String
+        get() = synchronized(lock) { activeOperationIdValue }
+        set(value) = synchronized(lock) {
+            activeOperationIdValue = value.trim()
+        }
 
-    @Volatile
-    var height: Int = DEFAULT_HEIGHT
-
-    @Volatile
-    var fps: Int = DEFAULT_FPS
-
-    @Volatile
-    var bitrate: Int = DEFAULT_BITRATE
-
-    @Volatile
-    var lastErrorMessage: String = ""
-
-    fun getStateDurationMs(): Long {
-        return System.currentTimeMillis() - lastStateChangedAtMs
+    fun getStateDurationMs(): Long = synchronized(lock) {
+        elapsedSince(stateChangedAtElapsedMsValue)
     }
 
-    fun getFrameAgeMs(): Long {
-        if (lastFrameAtMs <= 0L) return -1L
-        return System.currentTimeMillis() - lastFrameAtMs
+    fun getFrameAgeMs(): Long = synchronized(lock) {
+        if (lastFrameAtElapsedMsValue <= 0L) {
+            -1L
+        } else {
+            elapsedSince(lastFrameAtElapsedMsValue)
+        }
+    }
+
+    fun snapshot(): Snapshot = synchronized(lock) {
+        Snapshot(
+            state = stateValue,
+            stateChangedAtMs = stateChangedAtEpochMsValue,
+            stateDurationMs = elapsedSince(stateChangedAtElapsedMsValue),
+            rtspUrl = rtspUrlValue,
+            streamGeneration = streamGenerationValue,
+            encodedFrameCount = encodedFrameCountValue,
+            lastFrameAtMs = lastFrameAtEpochMsValue,
+            frameAgeMs = if (lastFrameAtElapsedMsValue <= 0L) {
+                -1L
+            } else {
+                elapsedSince(lastFrameAtElapsedMsValue)
+            },
+            rtspClientCount = rtspClientCountValue,
+            width = widthValue,
+            height = heightValue,
+            fps = fpsValue,
+            bitrate = bitrateValue,
+            lastErrorMessage = lastErrorMessageValue,
+            activeOperationId = activeOperationIdValue
+        )
     }
 
     fun reset() {
         clearToIdle()
     }
 
-    fun clearToIdle() {
-        state = STATE_IDLE
-        rtspUrl = ""
-        encodedFrameCount = 0
-        lastFrameAtMs = 0
-        rtspClientCount = 0
-        lastErrorMessage = ""
-    }
-
-    fun markWaitingPermission() {
-        state = STATE_WAITING_PERMISSION
-        rtspUrl = ""
-        encodedFrameCount = 0
-        lastFrameAtMs = 0
-        rtspClientCount = 0
-        lastErrorMessage = ""
-    }
-
-    fun markStopped() {
-        state = STATE_STOPPED
-        rtspUrl = ""
-        encodedFrameCount = 0
-        lastFrameAtMs = 0
-        rtspClientCount = 0
-        lastErrorMessage = ""
-    }
-
-    fun startNewSession() {
-        streamGeneration++
-        state = STATE_STARTING
-        rtspUrl = ""
-        encodedFrameCount = 0
-
-        // 중요:
-        // 실제 프레임이 나오기 전까지는 lastFrameAtMs를 0으로 둡니다.
-        // 그래야 WPF가 "프레임이 아직 없음"과 "프레임이 오래됨"을 구분할 수 있습니다.
-        lastFrameAtMs = 0
-
-        rtspClientCount = 0
-        lastErrorMessage = ""
-    }
-
-    fun setRunning(url: String) {
-        state = STATE_RUNNING
-        rtspUrl = url
-        lastErrorMessage = ""
-    }
-
-    fun updateFrameStatus() {
-        encodedFrameCount++
-        lastFrameAtMs = System.currentTimeMillis()
-
-        if (state == STATE_STARTING ||
-            state == STATE_IDLE ||
-            state == STATE_WAITING_PERMISSION ||
-            state == STATE_FROZEN
-        ) {
-            state = STATE_RUNNING
+    fun clearToIdle(clearOperation: Boolean = true) = synchronized(lock) {
+        setStateLocked(STATE_IDLE)
+        clearSessionTelemetryLocked()
+        lastErrorMessageValue = ""
+        if (clearOperation) {
+            activeOperationIdValue = ""
         }
     }
 
-    fun updateRtspClientCount(count: Int) {
-        rtspClientCount = count.coerceAtLeast(0)
+    fun markWaitingPermission(operationId: String = "") = synchronized(lock) {
+        setStateLocked(STATE_WAITING_PERMISSION)
+        clearSessionTelemetryLocked()
+        lastErrorMessageValue = ""
+        activeOperationIdValue = operationId.trim()
     }
 
-    fun markFrozen() {
-        state = STATE_FROZEN
+    fun markStopped(clearOperation: Boolean = true) = synchronized(lock) {
+        setStateLocked(STATE_STOPPED)
+        clearSessionTelemetryLocked()
+        lastErrorMessageValue = ""
+        if (clearOperation) {
+            activeOperationIdValue = ""
+        }
     }
 
-    fun setError(message: String = "") {
-        state = STATE_ERROR
-        rtspUrl = ""
-        lastErrorMessage = message
+    fun startNewSession(operationId: String = ""): Int = synchronized(lock) {
+        streamGenerationValue += 1
+        setStateLocked(STATE_STARTING)
+        clearSessionTelemetryLocked()
+        lastErrorMessageValue = ""
+        activeOperationIdValue = operationId.trim()
+        streamGenerationValue
+    }
+
+    fun setRunning(url: String) = synchronized(lock) {
+        setStateLocked(STATE_RUNNING)
+        rtspUrlValue = url.trim()
+        lastErrorMessageValue = ""
+    }
+
+    /**
+     * 프레임 카운터와 시각을 같은 임계구역에서 갱신합니다.
+     * 반환값은 갱신 후 프레임 번호입니다.
+     */
+    fun updateFrameStatus(): Long = synchronized(lock) {
+        encodedFrameCountValue += 1L
+        lastFrameAtEpochMsValue = System.currentTimeMillis()
+        lastFrameAtElapsedMsValue = SystemClock.elapsedRealtime()
+
+        if (
+            stateValue == STATE_STARTING ||
+            stateValue == STATE_IDLE ||
+            stateValue == STATE_WAITING_PERMISSION ||
+            stateValue == STATE_FROZEN
+        ) {
+            setStateLocked(STATE_RUNNING)
+        }
+
+        encodedFrameCountValue
+    }
+
+    fun updateRtspClientCount(count: Int) = synchronized(lock) {
+        rtspClientCountValue = count.coerceAtLeast(0)
+    }
+
+    fun markFrozen(message: String = "") = synchronized(lock) {
+        setStateLocked(STATE_FROZEN)
+        if (message.isNotBlank()) {
+            lastErrorMessageValue = message.trim()
+        }
+    }
+
+    fun setError(
+        message: String = "",
+        clearOperation: Boolean = false
+    ) = synchronized(lock) {
+        setStateLocked(STATE_ERROR)
+        rtspUrlValue = ""
+        rtspClientCountValue = 0
+        lastErrorMessageValue = message.trim()
+        if (clearOperation) {
+            activeOperationIdValue = ""
+        }
+    }
+
+    fun completeOperation(operationId: String) = synchronized(lock) {
+        if (operationId.isNotBlank() && activeOperationIdValue == operationId) {
+            activeOperationIdValue = ""
+        }
     }
 
     fun setCaptureConfig(
@@ -166,34 +288,11 @@ object CaptureStateStore {
         newHeight: Int,
         newFps: Int,
         newBitrate: Int
-    ) {
-        width = sanitizeEven(
-            newWidth,
-            min = MIN_WIDTH,
-            max = MAX_WIDTH,
-            fallback = DEFAULT_WIDTH
-        )
-
-        height = sanitizeEven(
-            newHeight,
-            min = MIN_HEIGHT,
-            max = MAX_HEIGHT,
-            fallback = DEFAULT_HEIGHT
-        )
-
-        fps = sanitizeInt(
-            newFps,
-            min = MIN_FPS,
-            max = MAX_FPS,
-            fallback = DEFAULT_FPS
-        )
-
-        bitrate = sanitizeInt(
-            newBitrate,
-            min = MIN_BITRATE,
-            max = MAX_BITRATE,
-            fallback = DEFAULT_BITRATE
-        )
+    ) = synchronized(lock) {
+        widthValue = sanitizeEven(newWidth, MIN_WIDTH, MAX_WIDTH, DEFAULT_WIDTH)
+        heightValue = sanitizeEven(newHeight, MIN_HEIGHT, MAX_HEIGHT, DEFAULT_HEIGHT)
+        fpsValue = sanitizeInt(newFps, MIN_FPS, MAX_FPS, DEFAULT_FPS)
+        bitrateValue = sanitizeInt(newBitrate, MIN_BITRATE, MAX_BITRATE, DEFAULT_BITRATE)
     }
 
     fun applyMultiDeviceProfile() {
@@ -212,6 +311,28 @@ object CaptureStateStore {
             newFps = 15,
             newBitrate = 1_500_000
         )
+    }
+
+    private fun setStateLocked(value: String) {
+        val normalized = value.trim().ifBlank { STATE_IDLE }
+        if (stateValue != normalized) {
+            stateValue = normalized
+            stateChangedAtEpochMsValue = System.currentTimeMillis()
+            stateChangedAtElapsedMsValue = SystemClock.elapsedRealtime()
+        }
+    }
+
+    private fun clearSessionTelemetryLocked() {
+        rtspUrlValue = ""
+        encodedFrameCountValue = 0L
+        lastFrameAtEpochMsValue = 0L
+        lastFrameAtElapsedMsValue = 0L
+        rtspClientCountValue = 0
+    }
+
+    private fun elapsedSince(startElapsedMs: Long): Long {
+        if (startElapsedMs <= 0L) return 0L
+        return (SystemClock.elapsedRealtime() - startElapsedMs).coerceAtLeast(0L)
     }
 
     private fun sanitizeInt(
