@@ -1,17 +1,21 @@
 package tdg.oculuswirelessadb.agent
 
 import android.os.SystemClock
+import android.util.Log
 import org.json.JSONObject
 
 /**
- * StoryWing 앱 실행 중 Agent의 자동 캡처 복구 Activity가 그 위로 올라오는 것을 막습니다.
+ * StoryWing Unity/OpenXR 앱의 첫 프레임 구간만 보호합니다.
  *
- * HTTP launch 요청부터 APP_STATE_ACTIVE 수신까지 자동 복구만 잠시 억제합니다.
- * 명시적인 WPF 캡처 시작/재시작 요청은 차단하지 않습니다.
+ * R2의 12시간 지속 세션은 제거했습니다. 일반 앱이 APP_STATE를 보내지 않아도
+ * 유한 시간 뒤 자동으로 해제되며, STOP/STOP_ALL은 즉시 clear합니다.
  */
 object AppLaunchGuard {
 
-    private const val DEFAULT_GUARD_MS = 45_000L
+    private const val TAG = "MQ-AppLaunchGuard"
+
+    const val DEFAULT_GUARD_MS = 20_000L
+    private const val ACTIVE_TAIL_MS = 1_500L
 
     private val lock = Any()
 
@@ -19,56 +23,142 @@ object AppLaunchGuard {
     private var guardedPackageName: String = ""
 
     @Volatile
+    private var startedAtElapsedMs: Long = 0L
+
+    @Volatile
     private var suppressUntilElapsedMs: Long = 0L
+
+    @Volatile
+    private var foregroundReady: Boolean = false
 
     fun begin(
         packageName: String,
         durationMs: Long = DEFAULT_GUARD_MS
     ) {
-        if (packageName.isBlank()) return
+        val normalized = packageName.trim()
+        if (normalized.isBlank()) return
+
+        val now = SystemClock.elapsedRealtime()
+        val safeDuration = durationMs.coerceIn(5_000L, 60_000L)
 
         synchronized(lock) {
-            guardedPackageName = packageName.trim()
-            suppressUntilElapsedMs =
-                SystemClock.elapsedRealtime() + durationMs.coerceAtLeast(1_000L)
+            guardedPackageName = normalized
+            startedAtElapsedMs = now
+            suppressUntilElapsedMs = now + safeDuration
+            foregroundReady = false
+        }
+
+        Log.i(
+            TAG,
+            "Finite launch guard started. package=$normalized durationMs=$safeDuration"
+        )
+    }
+
+    fun markForegroundReady(
+        packageName: String,
+        tailMs: Long = ACTIVE_TAIL_MS
+    ) {
+        val normalized = packageName.trim()
+        if (normalized.isBlank()) return
+
+        val now = SystemClock.elapsedRealtime()
+        val safeTail = tailMs.coerceIn(500L, 5_000L)
+
+        val updated = synchronized(lock) {
+            if (!guardedPackageName.equals(normalized, ignoreCase = true)) {
+                false
+            } else {
+                foregroundReady = true
+                suppressUntilElapsedMs = now + safeTail
+                true
+            }
+        }
+
+        if (updated) {
+            Log.i(
+                TAG,
+                "Foreground ready; guard tail applied. package=$normalized tailMs=$safeTail"
+            )
         }
     }
 
     fun clear() {
-        synchronized(lock) {
+        val previous = synchronized(lock) {
+            val value = guardedPackageName
             guardedPackageName = ""
+            startedAtElapsedMs = 0L
             suppressUntilElapsedMs = 0L
+            foregroundReady = false
+            value
+        }
+
+        if (previous.isNotBlank()) {
+            Log.i(TAG, "Finite launch guard cleared. package=$previous")
         }
     }
 
     fun clearFor(packageName: String) {
-        synchronized(lock) {
-            if (guardedPackageName.equals(packageName, ignoreCase = true)) {
-                guardedPackageName = ""
-                suppressUntilElapsedMs = 0L
-            }
+        val normalized = packageName.trim()
+        if (normalized.isBlank()) return
+
+        val matches = synchronized(lock) {
+            guardedPackageName.equals(normalized, ignoreCase = true)
         }
+
+        if (matches) clear()
     }
 
     fun isActive(): Boolean {
-        val active = SystemClock.elapsedRealtime() < suppressUntilElapsedMs
-        if (!active && suppressUntilElapsedMs != 0L) {
+        val now = SystemClock.elapsedRealtime()
+        val active = guardedPackageName.isNotBlank() && now < suppressUntilElapsedMs
+
+        if (!active && guardedPackageName.isNotBlank()) {
             clear()
         }
+
         return active
     }
 
-    fun remainingMs(): Long {
-        val remaining = suppressUntilElapsedMs - SystemClock.elapsedRealtime()
-        return remaining.coerceAtLeast(0L)
+    fun isActiveFor(packageName: String): Boolean {
+        return isActive() && guardedPackageName.equals(
+            packageName.trim(),
+            ignoreCase = true
+        )
     }
 
-    fun packageName(): String = guardedPackageName
+    fun isFirstFrameProtectionActive(): Boolean = isActive()
+
+    fun isFirstFrameProtectionActiveFor(packageName: String): Boolean {
+        return isActiveFor(packageName)
+    }
+
+    fun remainingMs(): Long {
+        if (!isActive()) return 0L
+        return (suppressUntilElapsedMs - SystemClock.elapsedRealtime())
+            .coerceAtLeast(0L)
+    }
+
+    fun sessionAgeMs(): Long {
+        if (!isActive() || startedAtElapsedMs <= 0L) return 0L
+        return (SystemClock.elapsedRealtime() - startedAtElapsedMs)
+            .coerceAtLeast(0L)
+    }
+
+    fun packageName(): String {
+        isActive()
+        return guardedPackageName
+    }
+
+    fun isForegroundReady(): Boolean = isActive() && foregroundReady
 
     fun toJson(): JSONObject {
         return JSONObject()
             .put("active", isActive())
             .put("packageName", guardedPackageName)
+            .put("foregroundReady", foregroundReady)
+            .put("firstFrameProtectionActive", isFirstFrameProtectionActive())
             .put("remainingMs", remainingMs())
+            .put("sessionAgeMs", sessionAgeMs())
+            .put("persistentSession", false)
     }
 }

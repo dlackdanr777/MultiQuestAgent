@@ -28,6 +28,7 @@ import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -36,7 +37,9 @@ import tdg.oculuswirelessadb.agent.AgentOperationStore
 import tdg.oculuswirelessadb.agent.AgentService
 import tdg.oculuswirelessadb.agent.AgentUiState
 import tdg.oculuswirelessadb.agent.AutoCapturePauseStore
+import tdg.oculuswirelessadb.agent.AppLaunchGuard
 import tdg.oculuswirelessadb.agent.KeepAliveController
+import tdg.oculuswirelessadb.agent.SystemSettingsLauncher
 import tdg.oculuswirelessadb.capture.CaptureService
 import tdg.oculuswirelessadb.capture.CaptureStateStore
 import java.lang.ref.WeakReference
@@ -59,21 +62,23 @@ class MainActivity : AppCompatActivity() {
         private const val SUPPRESS_AUTO_START_MS = 5_000L
         private const val DENIED_RETRY_PAUSE_MS = 2 * 60 * 1000L
 
+        // 물리적 공간 기록 삭제 화면을 확인하는 동안 자동 캡처 권한창이 다시 전면으로 뜨지 않게 합니다.
+        private const val PHYSICAL_SPACE_SETTINGS_SUPPRESS_MS = 10 * 60 * 1000L
+
         private const val CLOSE_BUTTON_SIZE_PX = 48
         private const val CLOSE_BUTTON_MARGIN_PX = 14
 
         private var currentRef: WeakReference<MainActivity>? = null
         private val companionHandler = Handler(Looper.getMainLooper())
 
-        /**
-         * WPF 종료 명령에서 Agent 설정 UI를 즉시 닫기 위한 함수입니다.
-         */
+        /** WPF 종료 명령에서 Agent 설정 UI task를 제거합니다. */
         fun finishCurrent() {
-            val activity = currentRef?.get()
+            val action = Runnable {
+                val activity = currentRef?.get()
 
-            companionHandler.post {
                 try {
-                    if (activity != null &&
+                    if (
+                        activity != null &&
                         !activity.isFinishing &&
                         !activity.isDestroyed
                     ) {
@@ -90,6 +95,274 @@ class MainActivity : AppCompatActivity() {
                         currentRef = null
                     }
                 }
+            }
+
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                action.run()
+            } else {
+                companionHandler.post(action)
+            }
+        }
+
+        /**
+         * 호환용 방어 함수입니다.
+         * AgentCommandHandler의 정상 launch 경로에서는 호출하지 않습니다.
+         * 외부 앱 세션 중 MainActivity가 예외적으로 전면화된 경우에만 plain finish합니다.
+         */
+        fun finishCurrentForExternalLaunchNow() {
+            val action = Runnable {
+                currentRef
+                    ?.get()
+                    ?.finishForExternalLaunchNow(
+                        "external_storywing_launch"
+                    )
+            }
+
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                action.run()
+            } else {
+                companionHandler.post(action)
+            }
+        }
+
+        fun finishCurrentForExternalLaunch() {
+            finishCurrentForExternalLaunchNow()
+        }
+
+        /**
+         * Meta Quest VRShell native launch Intent를 살아 있는 MainActivity에서 전송합니다.
+         *
+         * Lightning Launcher가 Quest VR 앱을 실행하는 방식과 동일하게:
+         *
+         * launcherActivity.startActivity(vrShellIntent)
+         *
+         * 를 사용합니다.
+         *
+         * 중요:
+         * - VRShell Intent의 FLAG_ACTIVITY_NEW_TASK를 제거하지 않습니다.
+         * - applicationContext fallback을 사용하지 않습니다.
+         * - Activity source record가 없는 실행을 허용하지 않습니다.
+         *
+         * applicationContext/Service에서 VRShell을 실행하면 Quest 로그에
+         * sourceRecord=null 또는 launch source=(unknown)이 남을 수 있고,
+         * 앱은 FOCUSED/72FPS여도 APP_START 전환 세션이 끝나지 않을 수 있습니다.
+         */
+        fun launchVrShellIntentNow(
+            sourceIntent: Intent
+        ): Boolean {
+            if (
+                Looper.myLooper() !=
+                Looper.getMainLooper()
+            ) {
+                Log.e(
+                    TAG,
+                    "launchVrShellIntentNow must run on Main Looper"
+                )
+
+                return false
+            }
+
+            val activity =
+                currentRef?.get()
+
+            if (
+                activity == null ||
+                activity.isFinishing ||
+                activity.isDestroyed
+            ) {
+                Log.e(
+                    TAG,
+                    "No live MainActivity source for VRShell launch. " +
+                            "Open the Agent UI once before remote launching."
+                )
+
+                return false
+            }
+
+            val vrShellIntent =
+                Intent(
+                    sourceIntent
+                )
+
+            return try {
+                activity.startActivity(
+                    vrShellIntent
+                )
+
+                Log.i(
+                    TAG,
+                    "VRShell immersive launch dispatched from MainActivity. " +
+                            "route=MAIN_ACTIVITY_VRSHELL_SOURCE " +
+                            "component=${vrShellIntent.component} " +
+                            "action=${vrShellIntent.action} " +
+                            "data=${vrShellIntent.data} " +
+                            "flags=0x${vrShellIntent.flags.toString(16)}"
+                )
+
+                true
+            } catch (e: Exception) {
+                Log.e(
+                    TAG,
+                    "MainActivity VRShell launch failed. " +
+                            "component=${vrShellIntent.component} " +
+                            "action=${vrShellIntent.action} " +
+                            "data=${vrShellIntent.data}",
+                    e
+                )
+
+                false
+            }
+        }
+
+        /**
+         * 기존 일반 Activity 직접 실행 호출부의 호환용입니다.
+         *
+         * VRShell native launch에는 launchVrShellIntentNow()를 사용해야 합니다.
+         */
+        fun launchExternalActivityNow(
+            sourceIntent: Intent
+        ): Boolean {
+            if (
+                Looper.myLooper() !=
+                Looper.getMainLooper()
+            ) {
+                Log.e(
+                    TAG,
+                    "launchExternalActivityNow must run on Main Looper"
+                )
+
+                return false
+            }
+
+            val activity =
+                currentRef?.get()
+
+            if (
+                activity == null ||
+                activity.isFinishing ||
+                activity.isDestroyed
+            ) {
+                Log.w(
+                    TAG,
+                    "No live MainActivity source for external launch"
+                )
+
+                return false
+            }
+
+            val activityIntent =
+                Intent(
+                    sourceIntent
+                ).apply {
+                    flags =
+                        flags and
+                                Intent.FLAG_ACTIVITY_NEW_TASK.inv()
+
+                    flags =
+                        flags and
+                                Intent.FLAG_ACTIVITY_CLEAR_TASK.inv()
+
+                    flags =
+                        flags and
+                                Intent.FLAG_ACTIVITY_CLEAR_TOP.inv()
+
+                    flags =
+                        flags and
+                                Intent.FLAG_ACTIVITY_SINGLE_TOP.inv()
+                }
+
+            return try {
+                activity.startActivity(
+                    activityIntent
+                )
+
+                Log.i(
+                    TAG,
+                    "External Activity launch dispatched from MainActivity. " +
+                            "component=${activityIntent.component} " +
+                            "action=${activityIntent.action} " +
+                            "flags=0x${activityIntent.flags.toString(16)}"
+                )
+
+                true
+            } catch (e: Exception) {
+                Log.e(
+                    TAG,
+                    "MainActivity external launch failed. " +
+                            "component=${activityIntent.component} " +
+                            "action=${activityIntent.action}",
+                    e
+                )
+
+                false
+            }
+        }
+
+        /**
+         * STOP/STOP_ALL에서 새 Activity를 띄우지 않고 Agent UI task만 뒤로 보냅니다.
+         *
+         * finish/removeTask 하지 않으므로 MainActivity 인스턴스는 살아 있고,
+         * 다음 원격 launch에서 VRShell의 실제 Activity source로 재사용됩니다.
+         *
+         * IdleShieldActivity 같은 2D panel Activity를 새로 띄우지 않기 때문에
+         * 종료 후 Quest volumetric panel/UI 전환 경쟁도 만들지 않습니다.
+         */
+        fun moveTaskToBackForRemoteStopNow(
+            reason: String
+        ): Boolean {
+            if (
+                Looper.myLooper() !=
+                Looper.getMainLooper()
+            ) {
+                Log.e(
+                    TAG,
+                    "moveTaskToBackForRemoteStopNow must run on Main Looper"
+                )
+
+                return false
+            }
+
+            val activity =
+                currentRef?.get()
+
+            if (
+                activity == null ||
+                activity.isFinishing ||
+                activity.isDestroyed
+            ) {
+                Log.w(
+                    TAG,
+                    "No live MainActivity to background. reason=$reason"
+                )
+
+                return false
+            }
+
+            return try {
+                AgentUiState.isMainActivityVisible =
+                    false
+
+                val moved =
+                    activity.moveTaskToBack(
+                        true
+                    )
+
+                Log.i(
+                    TAG,
+                    "Agent MainActivity moved to background. " +
+                            "reason=$reason moved=$moved"
+                )
+
+                moved
+            } catch (e: Exception) {
+                Log.w(
+                    TAG,
+                    "Failed to move Agent task to background. " +
+                            "reason=$reason",
+                    e
+                )
+
+                false
             }
         }
     }
@@ -141,6 +414,22 @@ class MainActivity : AppCompatActivity() {
 
         currentRef = WeakReference(this)
 
+        if (AppLaunchGuard.isActive()) {
+            Log.i(
+                TAG,
+                "MainActivity suppressed by StoryWing launch guard. " +
+                        "package=${AppLaunchGuard.packageName()}"
+            )
+
+            finishForExternalLaunchNow(
+                "onCreate_launch_guard"
+            )
+            return
+        }
+
+        // 업데이트 후 여러 저장소 중 하나에만 이름이 남은 경우 자동 복구합니다.
+        AgentNameStore.repair(this)
+
         // 종료 명령에서 표시했던 검은 차단 화면을 Agent 직접 오픈 시 해제합니다.
         IdleShieldActivity.finishCurrent()
 
@@ -178,6 +467,19 @@ class MainActivity : AppCompatActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
 
+        if (AppLaunchGuard.isActive()) {
+            Log.i(
+                TAG,
+                "MainActivity new Intent suppressed by StoryWing launch guard. " +
+                        "package=${AppLaunchGuard.packageName()}"
+            )
+
+            finishForExternalLaunchNow(
+                "onNewIntent_launch_guard"
+            )
+            return
+        }
+
         IdleShieldActivity.finishCurrent()
         AutoCapturePauseStore.resume(this)
 
@@ -192,6 +494,19 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+
+        if (AppLaunchGuard.isActive()) {
+            Log.i(
+                TAG,
+                "MainActivity resume suppressed by StoryWing launch guard. " +
+                        "package=${AppLaunchGuard.packageName()}"
+            )
+
+            finishForExternalLaunchNow(
+                "onResume_launch_guard"
+            )
+            return
+        }
 
         isUiHideInProgress = false
         AgentUiState.isMainActivityVisible = true
@@ -209,8 +524,28 @@ class MainActivity : AppCompatActivity() {
         source: String,
         delayMs: Long = AUTO_CAPTURE_DELAY_MS
     ) {
+        if (AppLaunchGuard.isActive()) {
+            Log.d(
+                TAG,
+                "Auto capture check skipped by StoryWing launch guard. " +
+                        "source=$source package=${AppLaunchGuard.packageName()}"
+            )
+            return
+        }
+
         handler.postDelayed(
-            { checkAndAutoStart(source) },
+            {
+                if (AppLaunchGuard.isActive()) {
+                    Log.d(
+                        TAG,
+                        "Delayed auto capture check cancelled by launch guard. " +
+                                "source=$source package=${AppLaunchGuard.packageName()}"
+                    )
+                    return@postDelayed
+                }
+
+                checkAndAutoStart(source)
+            },
             delayMs.coerceAtLeast(0L)
         )
     }
@@ -263,6 +598,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun checkAndAutoStart(source: String) {
+        if (AppLaunchGuard.isActive()) {
+            Log.d(
+                TAG,
+                "Auto capture blocked by StoryWing launch guard. " +
+                        "source=$source package=${AppLaunchGuard.packageName()}"
+            )
+            return
+        }
+
         if (isUiHideInProgress || notificationPermissionRequestInFlight) return
         if (!isScreenInteractive()) return
 
@@ -340,6 +684,15 @@ class MainActivity : AppCompatActivity() {
         delayMs: Long,
         reason: String
     ): Boolean {
+        if (AppLaunchGuard.isActive()) {
+            Log.d(
+                TAG,
+                "Capture permission scheduling blocked by StoryWing launch guard. " +
+                        "reason=$reason package=${AppLaunchGuard.packageName()}"
+            )
+            return false
+        }
+
         if (isUiHideInProgress || !isScreenInteractive()) return false
         if (isWaitingForPermission || isPermissionLaunchScheduled) return false
 
@@ -368,6 +721,16 @@ class MainActivity : AppCompatActivity() {
 
         handler.postDelayed({
             isPermissionLaunchScheduled = false
+
+            if (AppLaunchGuard.isActive()) {
+                Log.d(
+                    TAG,
+                    "Scheduled capture permission cancelled by launch guard. " +
+                            "reason=$reason package=${AppLaunchGuard.packageName()}"
+                )
+                return@postDelayed
+            }
+
             if (!isUiHideInProgress) {
                 requestScreenCapturePermissionInternal(reason)
             }
@@ -387,6 +750,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun requestScreenCapturePermissionInternal(reason: String) {
+        if (AppLaunchGuard.isActive()) {
+            Log.d(
+                TAG,
+                "Capture permission request blocked by StoryWing launch guard. " +
+                        "reason=$reason package=${AppLaunchGuard.packageName()}"
+            )
+            return
+        }
+
         if (isUiHideInProgress || !isScreenInteractive()) return
         if (isWaitingForPermission) return
 
@@ -462,6 +834,18 @@ class MainActivity : AppCompatActivity() {
         super.onActivityResult(requestCode, resultCode, data)
 
         if (requestCode != REQUEST_CAPTURE_CODE) return
+
+        if (AppLaunchGuard.isActive()) {
+            Log.w(
+                TAG,
+                "Late MediaProjection result ignored during external app session. " +
+                        "package=${AppLaunchGuard.packageName()}"
+            )
+            isWaitingForPermission = false
+            isPermissionLaunchScheduled = false
+            handler.removeCallbacks(permissionTimeoutRunnable)
+            return
+        }
 
         handler.removeCallbacks(permissionTimeoutRunnable)
         isWaitingForPermission = false
@@ -557,6 +941,42 @@ class MainActivity : AppCompatActivity() {
             { waitUntilCaptureRunningKeepUi(startedAtElapsedMs) },
             WAIT_RUNNING_INTERVAL_MS
         )
+    }
+
+    /**
+     * StoryWing/OpenXR 앱 실행 보호 중에는 Agent 설정 UI가 전면 포커스를
+     * 다시 가져가지 않도록 현재 Activity만 plain finish합니다.
+     */
+    private fun finishForExternalLaunchNow(
+        reason: String
+    ) {
+        if (isFinishing || isDestroyed) {
+            return
+        }
+
+        isUiHideInProgress = true
+        isWaitingForPermission = false
+        isPermissionLaunchScheduled = false
+        notificationPermissionRequestInFlight = false
+        suppressAutoStartUntilElapsedMs = Long.MAX_VALUE
+        AgentUiState.isMainActivityVisible = false
+        handler.removeCallbacksAndMessages(null)
+
+        Log.i(
+            TAG,
+            "Agent MainActivity closed for external StoryWing launch. " +
+                    "reason=$reason package=${AppLaunchGuard.packageName()}"
+        )
+
+        try {
+            finish()
+        } catch (_: Exception) {
+        }
+
+        try {
+            overridePendingTransition(0, 0)
+        } catch (_: Exception) {
+        }
     }
 
     /**
@@ -659,6 +1079,51 @@ class MainActivity : AppCompatActivity() {
         CaptureStateStore.markStopped()
     }
 
+    /**
+     * Agent UI의 "룸스캔 데이터 삭제" 버튼 동작입니다.
+     * AgentService와 HTTP 서버는 종료하지 않습니다.
+     */
+    private fun openPhysicalSpaceHistorySettingsFromButton() {
+        if (isFinishing || isDestroyed) return
+
+        // 설정을 보고 있는 동안 자동 화면공유 복구 UI가 덮어쓰지 않도록 억제합니다.
+        suppressAutoStartUntilElapsedMs =
+            SystemClock.elapsedRealtime() + PHYSICAL_SPACE_SETTINGS_SUPPRESS_MS
+
+        try {
+            AgentService.start(this)
+            KeepAliveController.acquire(this)
+        } catch (e: Exception) {
+            Log.w(TAG, "Agent 유지 요청 실패", e)
+        }
+
+        val result = SystemSettingsLauncher.openPhysicalSpaceHistory(this)
+
+        if (result.opened) {
+            Log.w(
+                TAG,
+                "물리적 공간 기록 삭제 화면 실행 요청 성공. uri=${result.uri}"
+            )
+
+            Toast.makeText(
+                applicationContext,
+                "물리적 공간 기록 삭제 항목을 누르세요.",
+                Toast.LENGTH_SHORT
+            ).show()
+        } else {
+            Log.e(
+                TAG,
+                "물리적 공간 기록 삭제 화면 실행 실패. error=${result.error}"
+            )
+
+            Toast.makeText(
+                applicationContext,
+                "공간 데이터 삭제 화면 실행 실패: ${result.error}",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+
     private fun createContentView(): View {
         val root = FrameLayout(this).apply {
             layoutParams = FrameLayout.LayoutParams(
@@ -738,6 +1203,14 @@ class MainActivity : AppCompatActivity() {
 
             addView(createStyledButton("배터리 최적화 제외 설정") {
                 ensureBatteryOptimized()
+            })
+
+            // 공간 데이터 삭제 관련 설정은 일반 송출 제어 버튼 아래에 배치합니다.
+            addView(createStyledButton("방 데이터 삭제 설정 열기") {
+                openPhysicalSpaceHistorySettingsFromButton()
+            }.apply {
+                setTextColor(Color.parseColor("#D84315"))
+                contentDescription = "Meta Quest 물리적 공간 기록 삭제 설정 열기"
             })
 
             addView(createStyledButton("창 숨기기") {
@@ -929,6 +1402,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onPause() {
+        try {
+            if (::nameInput.isInitialized) {
+                AgentNameStore.setDeviceName(
+                    this,
+                    nameInput.text?.toString().orEmpty()
+                )
+            }
+        } catch (_: Exception) {
+        }
+
         AgentUiState.isMainActivityVisible = false
         super.onPause()
     }

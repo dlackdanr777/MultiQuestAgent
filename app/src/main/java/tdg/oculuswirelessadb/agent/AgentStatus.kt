@@ -19,8 +19,8 @@ import java.net.Inet4Address
 object AgentStatus {
 
     private const val TAG = "MQ-STATUS"
-    private const val AGENT_VERSION = "rtsp-agent-1.5.0"
-    private const val API_VERSION = 5
+    private const val AGENT_VERSION = "rtsp-agent-1.7.1-stable-session-r2"
+    private const val API_VERSION = 7
 
     private const val BATTERY_CACHE_MS = 3_000L
     private const val THERMAL_CACHE_MS = 10_000L
@@ -98,9 +98,14 @@ object AgentStatus {
         val appContext = context.applicationContext
         val deviceId = deviceId(appContext)
 
-        val savedName = AgentNameStore.getDeviceName(appContext)
-        val deviceName = savedName.ifBlank {
+        val nameIdentity = AgentNameStore.getIdentity(appContext)
+        val deviceName = nameIdentity.name.ifBlank {
             "Quest3_${deviceId.take(4)}"
+        }
+        val deviceNameSource = if (nameIdentity.isCustom) {
+            "custom"
+        } else {
+            "generated"
         }
 
         val ip = currentIpv4(appContext) ?: "0.0.0.0"
@@ -124,6 +129,8 @@ object AgentStatus {
             .put("apiVersion", API_VERSION)
 
             .put("deviceName", deviceName)
+            .put("deviceNameSource", deviceNameSource)
+            .put("deviceNameUpdatedAtMs", nameIdentity.updatedAtMs)
             .put("deviceId", deviceId)
             .put("model", Build.MODEL ?: "")
             .put("serial", getSerial())

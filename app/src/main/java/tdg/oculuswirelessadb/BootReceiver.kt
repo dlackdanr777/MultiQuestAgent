@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.SystemClock
 import android.util.Log
+import tdg.oculuswirelessadb.agent.AgentNameStore
 import tdg.oculuswirelessadb.agent.AgentService
 import tdg.oculuswirelessadb.agent.AutoCapturePauseStore
 import tdg.oculuswirelessadb.capture.CaptureService
@@ -20,10 +21,7 @@ class BootReceiver : BroadcastReceiver() {
         private const val KEY_LAST_BOOT_EPOCH = "last_boot_epoch"
         private const val BOOT_EPOCH_TOLERANCE_MS = 60_000L
 
-        // 부팅 직후 자동 캡처 지연 10초
         private const val BOOT_AUTO_CAPTURE_DELAY_MS = 7_000L
-
-        // 앱 업데이트 직후 자동 캡처 지연 2분
         private const val AFTER_PACKAGE_REPLACED_DELAY_MS = 2 * 60 * 1000L
     }
 
@@ -33,23 +31,31 @@ class BootReceiver : BroadcastReceiver() {
         Log.i(TAG, "System event received: $action")
 
         when (action) {
-            Intent.ACTION_MY_PACKAGE_REPLACED -> {
+            Intent.ACTION_MY_PACKAGE_REPLACED ->
                 handlePackageReplaced(context)
-            }
 
             Intent.ACTION_BOOT_COMPLETED,
-            Intent.ACTION_LOCKED_BOOT_COMPLETED -> {
+            Intent.ACTION_LOCKED_BOOT_COMPLETED ->
                 handleBootCompleted(context)
-            }
 
-            else -> {
-                Log.d(TAG, "Ignored action: $action")
-            }
+            else -> Log.d(TAG, "Ignored action: $action")
         }
     }
 
     private fun handlePackageReplaced(context: Context) {
-        Log.w(TAG, "App package replaced. Pausing auto capture temporarily.")
+        Log.w(TAG, "App package replaced. Repair identity and pause capture temporarily.")
+
+        try {
+            val identity = AgentNameStore.repair(context)
+            Log.i(
+                TAG,
+                "Agent name repaired after update. " +
+                    "custom=${identity.isCustom} source=${identity.source} " +
+                    "name='${identity.name}'"
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "AgentNameStore repair failed after update", e)
+        }
 
         try {
             CaptureService.stop(context)
@@ -59,8 +65,6 @@ class BootReceiver : BroadcastReceiver() {
 
         CaptureStateStore.clearToIdle()
 
-        // 업데이트 직후에는 먼저 pause를 걸고
-        // 그 다음 AgentService를 시작합니다.
         AutoCapturePauseStore.pause(
             context = context,
             durationMs = AFTER_PACKAGE_REPLACED_DELAY_MS,
@@ -76,11 +80,26 @@ class BootReceiver : BroadcastReceiver() {
     }
 
     private fun handleBootCompleted(context: Context) {
-        val bootEpoch = System.currentTimeMillis() - SystemClock.elapsedRealtime()
-        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val lastBootEpoch = prefs.getLong(KEY_LAST_BOOT_EPOCH, -1L)
+        try {
+            AgentNameStore.repair(context)
+        } catch (e: Exception) {
+            Log.w(TAG, "Agent name repair failed on boot", e)
+        }
 
-        if (lastBootEpoch > 0 &&
+        val bootEpoch =
+            System.currentTimeMillis() - SystemClock.elapsedRealtime()
+
+        val prefs = context.getSharedPreferences(
+            PREFS,
+            Context.MODE_PRIVATE
+        )
+
+        val lastBootEpoch = prefs.getLong(
+            KEY_LAST_BOOT_EPOCH,
+            -1L
+        )
+
+        if (lastBootEpoch > 0L &&
             abs(lastBootEpoch - bootEpoch) < BOOT_EPOCH_TOLERANCE_MS
         ) {
             Log.i(TAG, "Already handled this boot epoch. Skip duplicate boot event.")
@@ -91,15 +110,11 @@ class BootReceiver : BroadcastReceiver() {
             .putLong(KEY_LAST_BOOT_EPOCH, bootEpoch)
             .apply()
 
-        // 중요:
-        // AgentService.start보다 pause가 먼저여야 합니다.
         AutoCapturePauseStore.pause(
             context = context,
             durationMs = BOOT_AUTO_CAPTURE_DELAY_MS,
-            reason = "BOOT_GRACE_10_SECONDS"
+            reason = "BOOT_GRACE_7_SECONDS"
         )
-
-        Log.i(TAG, "Boot handled. Auto capture delayed for 10 seconds.")
 
         try {
             AgentService.start(context)

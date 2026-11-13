@@ -490,22 +490,15 @@ class AgentService : Service() {
             return
         }
 
-        if (!explicit && AppLaunchGuard.isActive()) {
-            val delayMs = AppLaunchGuard.remainingMs() +
-                    APP_LAUNCH_GUARD_RECHECK_PADDING_MS
-
-            Log.i(
-                TAG,
-                "자동 캡처 복구를 StoryWing 앱 실행 완료 뒤로 연기합니다. " +
-                        "reason=$reason package=${AppLaunchGuard.packageName()} delayMs=$delayMs"
+        if (
+            deferRecoveryForStoryWingLaunch(
+                reason = reason,
+                requestedOperationId = requestedOperationId,
+                restart = restart,
+                explicit = explicit,
+                phase = "entry"
             )
-
-            scheduleRecovery(
-                reason = "APP_LAUNCH_GUARD_$reason",
-                delayMs = delayMs,
-                priority = PRIORITY_AUTO,
-                addJitter = false
-            )
+        ) {
             return
         }
 
@@ -575,6 +568,22 @@ class AgentService : Service() {
             )
         }
 
+        /*
+         * recovery 작업이 대기하는 동안 StoryWing launch가 새로 시작됐을 수 있습니다.
+         * CaptureService 정리나 권한 Activity 실행 직전에 다시 확인합니다.
+         */
+        if (
+            deferRecoveryForStoryWingLaunch(
+                reason = reason,
+                requestedOperationId = operationId,
+                restart = restart,
+                explicit = explicit,
+                phase = "before_capture_cleanup"
+            )
+        ) {
+            return
+        }
+
         if (
             CaptureService.isServiceAlive ||
             CaptureService.isCleanupInProgress ||
@@ -612,6 +621,18 @@ class AgentService : Service() {
             return
         }
 
+        if (
+            deferRecoveryForStoryWingLaunch(
+                reason = reason,
+                requestedOperationId = operationId,
+                restart = restart,
+                explicit = explicit,
+                phase = "before_permission_activity"
+            )
+        ) {
+            return
+        }
+
         CaptureStateStore.clearToIdle(clearOperation = false)
         CaptureStateStore.activeOperationId = operationId
         AgentOperationStore.markDispatched(
@@ -633,6 +654,59 @@ class AgentService : Service() {
         }
 
         verifyCaptureActivityLaunch(operationId)
+    }
+
+    /**
+     * StoryWing/OpenXR 앱 첫 프레임 보호 중에는 자동/수동/명시적 요청을 가리지 않고
+     * CapturePermissionActivity 실행을 연기합니다.
+     *
+     * explicit 요청까지 통과시키던 기존 코드는 투명 MediaProjection Activity가
+     * XR 앱 위로 올라와 오디오는 재생되지만 화면은 Meta 로딩 공간에 남는
+     * 포커스 경쟁을 만들 수 있었습니다.
+     */
+    private fun deferRecoveryForStoryWingLaunch(
+        reason: String,
+        requestedOperationId: String,
+        restart: Boolean,
+        explicit: Boolean,
+        phase: String
+    ): Boolean {
+        if (!AppLaunchGuard.isActive()) {
+            return false
+        }
+
+        val delayMs =
+            AppLaunchGuard.remainingMs() +
+                    APP_LAUNCH_GUARD_RECHECK_PADDING_MS
+
+        /*
+         * guard 만료 뒤 재예약된 복구가 RECOVERY_COOLDOWN_MS에 막히지 않게 합니다.
+         */
+        lastRecoveryAtElapsedMs = 0L
+
+        Log.i(
+            TAG,
+            "Capture recovery deferred by StoryWing launch guard. " +
+                    "phase=$phase reason=$reason " +
+                    "package=${AppLaunchGuard.packageName()} " +
+                    "delayMs=$delayMs explicit=$explicit restart=$restart " +
+                    "operationId=$requestedOperationId"
+        )
+
+        scheduleRecovery(
+            reason = "APP_LAUNCH_GUARD_$reason",
+            delayMs = delayMs,
+            operationId = requestedOperationId,
+            restart = restart,
+            priority = if (explicit) {
+                PRIORITY_EXPLICIT
+            } else {
+                PRIORITY_AUTO
+            },
+            addJitter = false
+        )
+
+        return true
     }
 
     private fun verifyCaptureActivityLaunch(operationId: String) {
@@ -670,6 +744,16 @@ class AgentService : Service() {
         reason: String,
         operationId: String
     ): Boolean {
+        if (AppLaunchGuard.isActive()) {
+            Log.w(
+                TAG,
+                "CapturePermissionActivity launch blocked by late StoryWing guard. " +
+                        "package=${AppLaunchGuard.packageName()} " +
+                        "reason=$reason operationId=$operationId"
+            )
+            return false
+        }
+
         val intent = CapturePermissionActivity.createIntent(
             context = this,
             reason = reason,

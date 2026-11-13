@@ -13,8 +13,8 @@ android {
         targetSdk 34
 
         // 버전 정보
-        versionCode 38
-        versionName "0.1.37"
+        versionCode 49
+        versionName "0.1.48"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }

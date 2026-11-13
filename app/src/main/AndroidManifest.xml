@@ -26,7 +26,7 @@
         <package android:name="com.StoryWing.XR_Coding" />
         <package android:name="com.StoryWing.Storywing_Class" />
         <package android:name="com.StoryWing.StorywingClass" />
-
+        <package android:name="com.StoryWing.XRMindSteps" />
         <package android:name="com.StoryWing.App1" />
         <package android:name="com.StoryWing.App2" />
         <package android:name="com.StoryWing.App3" />
@@ -47,6 +47,9 @@
         <package android:name="com.StoryWing.App18" />
         <package android:name="com.StoryWing.App19" />
         <package android:name="com.StoryWing.App20" />
+
+        <!-- Meta Quest Device Permissions / 물리적 공간 기록 삭제 화면 -->
+        <package android:name="com.oculus.panelapp.settings" />
     </queries>
 
     <uses-permission android:name="android.permission.INTERNET" />
@@ -71,6 +74,7 @@
 
     <application
         android:allowBackup="false"
+        android:hasFragileUserData="true"
         android:usesCleartextTraffic="true"
         android:label="@string/app_name"
         android:icon="@mipmap/ic_launcher"
@@ -95,7 +99,7 @@
             android:exported="false"
             android:theme="@style/Theme.MultiQuest.Transparent"
             android:launchMode="singleTask"
-            android:taskAffinity="tdg.oculuswirelessadb.capture"
+            android:taskAffinity="${applicationId}.capture"
             android:excludeFromRecents="true"
             android:noHistory="false"
             android:finishOnTaskLaunch="false"
@@ -106,7 +110,7 @@
             android:exported="false"
             android:theme="@style/Theme.MultiQuest.Transparent"
             android:launchMode="singleTask"
-            android:taskAffinity="tdg.oculuswirelessadb.keepawake"
+            android:taskAffinity="${applicationId}.keepawake"
             android:excludeFromRecents="true"
             android:noHistory="false"
             android:finishOnTaskLaunch="false"
@@ -120,7 +124,7 @@
             android:exported="false"
             android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
             android:launchMode="singleTask"
-            android:taskAffinity="tdg.oculuswirelessadb.idle"
+            android:taskAffinity="${applicationId}.idle"
             android:excludeFromRecents="true"
             android:noHistory="false"
             android:finishOnTaskLaunch="false"
@@ -161,6 +165,7 @@
 
             <intent-filter>
                 <action android:name="com.storywing.multiquest.APP_STATE" />
+                <action android:name="com.storywing.multiquest.COMMAND_ACK" />
             </intent-filter>
         </receiver>
 

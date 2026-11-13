@@ -21,6 +21,7 @@ import tdg.oculuswirelessadb.agent.AgentOperationStore
 import tdg.oculuswirelessadb.agent.AgentService
 import tdg.oculuswirelessadb.agent.AgentUiState
 import tdg.oculuswirelessadb.agent.AutoCapturePauseStore
+import tdg.oculuswirelessadb.agent.AppLaunchGuard
 import tdg.oculuswirelessadb.agent.KeepAliveController
 import tdg.oculuswirelessadb.capture.CaptureService
 import tdg.oculuswirelessadb.capture.CaptureStateStore
@@ -46,18 +47,41 @@ class CapturePermissionActivity : AppCompatActivity() {
         private var currentRef: WeakReference<CapturePermissionActivity>? = null
         private val companionHandler = Handler(Looper.getMainLooper())
 
-        /**
-         * 앱 종료 명령과 동시에 떠 있는 MediaProjection 권한 UI를 닫습니다.
-         */
+        /** 앱 종료 명령과 동시에 떠 있는 MediaProjection 권한 UI를 닫습니다. */
         fun finishCurrentForUiDisable() {
-            val activity = currentRef?.get()
-
-            companionHandler.post {
-                try {
-                    activity?.finishForUiDisable()
-                } catch (_: Exception) {
-                }
+            val action = Runnable {
+                currentRef
+                    ?.get()
+                    ?.finishForUiDisable()
             }
+
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                action.run()
+            } else {
+                companionHandler.post(action)
+            }
+        }
+
+        /**
+         * 외부 StoryWing 앱 실행 전에 이미 열려 있던 권한 Activity만 닫습니다.
+         * launch 이후 반복 정리는 수행하지 않습니다.
+         */
+        fun finishCurrentForExternalLaunchNow() {
+            val action = Runnable {
+                currentRef
+                    ?.get()
+                    ?.finishForExternalLaunch()
+            }
+
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                action.run()
+            } else {
+                companionHandler.post(action)
+            }
+        }
+
+        fun finishCurrentForExternalLaunch() {
+            finishCurrentForExternalLaunchNow()
         }
 
         fun createIntent(
@@ -115,6 +139,23 @@ class CapturePermissionActivity : AppCompatActivity() {
         readIntentData(intent)
         AgentUiState.isCapturePermissionActivityAlive = true
 
+        /*
+         * StoryWing/OpenXR 앱 실행 보호 구간에는 투명 권한 Activity도
+         * 전면 포커스를 가져가면 안 됩니다.
+         */
+        if (AppLaunchGuard.isActive()) {
+            Log.i(
+                TAG,
+                "CapturePermissionActivity suppressed by launch guard. " +
+                        "package=${AppLaunchGuard.packageName()} " +
+                        "reason=$reason operationId=$operationId"
+            )
+
+            cancelOperationForExternalLaunch()
+            finishForExternalLaunch()
+            return
+        }
+
         makeWindowTransparent()
 
         projectionManager =
@@ -158,6 +199,22 @@ class CapturePermissionActivity : AppCompatActivity() {
         )
     }
 
+    override fun onResume() {
+        super.onResume()
+
+        if (AppLaunchGuard.isActive()) {
+            Log.i(
+                TAG,
+                "CapturePermissionActivity resume suppressed by launch guard. " +
+                        "package=${AppLaunchGuard.packageName()} " +
+                        "operationId=$operationId"
+            )
+
+            cancelOperationForExternalLaunch()
+            finishForExternalLaunch()
+        }
+    }
+
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
         if (intent == null) return
@@ -168,6 +225,29 @@ class CapturePermissionActivity : AppCompatActivity() {
         val incomingReason = intent
             .getStringExtra(EXTRA_REASON)
             .orEmpty()
+
+        if (AppLaunchGuard.isActive()) {
+            Log.i(
+                TAG,
+                "CapturePermissionActivity new Intent suppressed by launch guard. " +
+                        "package=${AppLaunchGuard.packageName()} " +
+                        "incomingOperationId=$incomingOperationId"
+            )
+
+            if (
+                incomingOperationId.isNotBlank() &&
+                AgentOperationStore.isPending(incomingOperationId)
+            ) {
+                AgentOperationStore.cancel(
+                    incomingOperationId,
+                    "capture_ui_deferred_by_storywing_launch"
+                )
+            }
+
+            cancelOperationForExternalLaunch()
+            finishForExternalLaunch()
+            return
+        }
 
         if (requested && !resultHandled && !finishingCaptureTask) {
             if (incomingOperationId.isNotBlank() &&
@@ -255,6 +335,20 @@ class CapturePermissionActivity : AppCompatActivity() {
 
     private fun requestCapturePermissionOnce() {
         if (requested || resultHandled || finishingCaptureTask) return
+
+        if (AppLaunchGuard.isActive()) {
+            Log.i(
+                TAG,
+                "Capture permission request deferred by StoryWing launch. " +
+                        "package=${AppLaunchGuard.packageName()} " +
+                        "remainingMs=${AppLaunchGuard.remainingMs()} " +
+                        "operationId=$operationId"
+            )
+
+            cancelOperationForExternalLaunch()
+            finishForExternalLaunch()
+            return
+        }
 
         if (!isScreenInteractive()) {
             failAndFinish("device_not_interactive", retryable = true)
@@ -353,6 +447,17 @@ class CapturePermissionActivity : AppCompatActivity() {
 
         if (requestCode != REQUEST_CAPTURE) return
         if (resultHandled || finishingCaptureTask) return
+
+        if (AppLaunchGuard.isActive()) {
+            Log.w(
+                TAG,
+                "Late MediaProjection result ignored during external app session. " +
+                        "package=${AppLaunchGuard.packageName()} operationId=$operationId"
+            )
+            cancelOperationForExternalLaunch()
+            finishForExternalLaunch()
+            return
+        }
 
         handler.removeCallbacks(permissionTimeoutRunnable)
         resultHandled = true
@@ -546,6 +651,57 @@ class CapturePermissionActivity : AppCompatActivity() {
         }
 
         finishCleanly()
+    }
+
+    private fun cancelOperationForExternalLaunch() {
+        if (
+            operationId.isNotBlank() &&
+            AgentOperationStore.isPending(operationId)
+        ) {
+            AgentOperationStore.cancel(
+                operationId,
+                "capture_ui_deferred_by_storywing_launch"
+            )
+        }
+    }
+
+    /**
+     * 외부 앱을 전면 실행하기 직전에 호출하는 안전 정리 경로입니다.
+     * finishAndRemoveTask() 대신 plain finish()만 사용합니다.
+     */
+    private fun finishForExternalLaunch() {
+        if (finishingCaptureTask) return
+
+        finishingCaptureTask = true
+        requested = false
+        resultHandled = true
+
+        handler.removeCallbacksAndMessages(
+            null
+        )
+
+        cancelOperationForExternalLaunch()
+
+        AgentUiState.isCapturePermissionActivityAlive =
+            false
+
+        try {
+            finish()
+        } catch (e: Exception) {
+            Log.w(
+                TAG,
+                "CapturePermissionActivity plain finish failed",
+                e
+            )
+        }
+
+        try {
+            overridePendingTransition(
+                0,
+                0
+            )
+        } catch (_: Exception) {
+        }
     }
 
     /**

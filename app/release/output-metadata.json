@@ -4,16 +4,16 @@
     "type": "APK",
     "kind": "Directory"
   },
-  "applicationId": "tdg.oculuswirelessadb",
+  "applicationId": "tdg.MultiquestAgent",
   "variantName": "release",
   "elements": [
     {
       "type": "SINGLE",
       "filters": [],
       "attributes": [],
-      "versionCode": 1,
-      "versionName": "1.3",
-      "outputFile": "app-release.apk"
+      "versionCode": 49,
+      "versionName": "0.1.48",
+      "outputFile": "MultiquestAgent_release_v0.1.48.apk"
     }
   ],
   "elementType": "File",
@@ -22,14 +22,14 @@
       "minApi": 28,
       "maxApi": 30,
       "baselineProfiles": [
-        "baselineProfiles/1/app-release.dm"
+        "baselineProfiles/1/MultiquestAgent_release_v0.1.48.dm"
       ]
     },
     {
       "minApi": 31,
       "maxApi": 2147483647,
       "baselineProfiles": [
-        "baselineProfiles/0/app-release.dm"
+        "baselineProfiles/0/MultiquestAgent_release_v0.1.48.dm"
       ]
     }
   ],
